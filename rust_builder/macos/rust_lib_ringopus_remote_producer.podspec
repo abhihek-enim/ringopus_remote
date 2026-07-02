@@ -25,6 +25,17 @@ A new Flutter FFI plugin project.
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.swift_version = '5.0'
 
+  # enigo's macOS backend (used by the input-injection Rust code) calls
+  # Carbon Text Input Source Services (TISCopyCurrentKeyboardInputSource,
+  # LMGetKbdType, etc.) for keyboard layout lookups. Cargo's own
+  # cargo:rustc-link-lib=framework=... directives only propagate to the
+  # immediate linker invocation when Cargo produces the final binary; they
+  # don't carry through when the crate is built as a staticlib (.a) and
+  # linked later by Xcode, as cargokit does here. Xcode's link step needs
+  # this framework declared explicitly or it fails with "symbol(s) not
+  # found for architecture arm64" on TIS*/LMGetKbdType symbols.
+  s.frameworks = 'Carbon'
+
   s.script_phase = {
     :name => 'Build Rust library',
     # First argument is relative path to the `rust` folder, second is name of rust library
