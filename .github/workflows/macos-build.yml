@@ -23,13 +23,18 @@ name: macOS build (compile-check)
 #   - Any actual capture/produce/inject behavior at runtime.
 # All of the above require manual testing on real macOS hardware.
 #
-# No code signing or notarization - this produces a local-testing-only
-# unsigned .app, not something to distribute outside the team.
+# No code signing or notarization - the DMG is unsigned, for local team
+# testing only via the "latest" pre-release below, not for distribution
+# outside the team. Opening it will trigger an unsigned-app Gatekeeper
+# warning (right-click -> Open, or System Settings -> Privacy & Security).
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+
+permissions:
+  contents: write # needed to create/update the "latest" release
 
 jobs:
   build-macos:
@@ -72,3 +77,30 @@ jobs:
           # download.
           path: build/macos/Build/Products/Debug/ringopus_remote_producer.app
           retention-days: 14
+
+      - name: Package as .dmg
+        run: |
+          hdiutil create -volname "Ringopus Remote Producer" \
+            -srcfolder build/macos/Build/Products/Debug/ringopus_remote_producer.app \
+            -ov -format UDZO \
+            ringopus_remote_producer-macos.dmg
+
+      - name: Publish/update the "latest" release with the .dmg
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: Latest macOS build (unsigned, testing only)
+          # Deliberately not prerelease: true - GitHub's own "latest release"
+          # UI/API excludes prereleases by default, which would conflict
+          # with this tag literally being named "latest" and defeat the
+          # one-click-download goal. The body text below makes clear this
+          # isn't a real numbered/signed release.
+          # Re-running the workflow updates this same release/asset in place
+          # instead of piling up a new release per push - one stable
+          # download link at all times: .../releases/latest
+          body: |
+            Automated unsigned macOS build from commit ${{ github.sha }}.
+            Local testing only - see the workflow file for what this build
+            does and doesn't prove. Unsigned: expect a Gatekeeper warning on
+            first open (right-click -> Open).
+          files: ringopus_remote_producer-macos.dmg
