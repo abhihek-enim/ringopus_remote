@@ -1,0 +1,64 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Vendored Rust crate build artifacts (see native/whixp_transport/PROVENANCE.md)
+native/whixp_transport/target/
+
+# flutter_rust_bridge crate build artifacts
+rust/target/
+
+# Compiled native libraries produced by the Rust builds above - these are
+# build output, not vendored source, and get rebuilt by CMake/Xcode.
+*.dll
+*.dylib
+
+# Windows OS junk (in addition to .DS_Store above for macOS)
+Thumbs.db
+ehthumbs.db
+
+# whixp's session-storage sqlite db, created in the working directory at
+# runtime since we haven't set an explicit internalDatabasePath.
+whixp_*.db
