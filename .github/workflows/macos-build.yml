@@ -63,13 +63,12 @@ jobs:
           cp native/whixp_transport/target/release/libwhixp_transport.dylib "$FRAMEWORKS_DIR/"
           echo "Copied into $FRAMEWORKS_DIR - see the workflow file header for what this does and doesn't prove."
 
-      - name: Zip the .app for download
-        run: |
-          cd build/macos/Build/Products/Debug
-          zip -r ringopus_remote_producer-macos.zip ringopus_remote_producer.app
-
       - uses: actions/upload-artifact@v4
         with:
           name: ringopus_remote_producer-macos
-          path: build/macos/Build/Products/Debug/ringopus_remote_producer-macos.zip
+          # actions/upload-artifact zips directories itself, preserving the
+          # .app bundle structure and permissions - no need to zip it
+          # ourselves first, which would just produce a zip-inside-a-zip on
+          # download.
+          path: build/macos/Build/Products/Debug/ringopus_remote_producer.app
           retention-days: 14
