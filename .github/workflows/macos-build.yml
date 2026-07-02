@@ -1,0 +1,75 @@
+name: macOS build (compile-check)
+
+# WHAT A GREEN RUN PROVES:
+#   - native/whixp_transport (whixp's required native transport crate)
+#     actually cross-compiles for macOS as a .dylib, on real Apple
+#     toolchain - previously unverified, since it was only ever built for
+#     Windows so far.
+#   - The main flutter_rust_bridge crate (rust/, for input injection)
+#     builds via cargokit's existing macOS Podfile integration.
+#   - `flutter build macos` succeeds end to end: Dart/Flutter code compiles,
+#     CocoaPods resolves, the .app bundle is produced.
+#
+# WHAT A GREEN RUN DOES NOT PROVE (needs a real Mac, not covered here):
+#   - That libwhixp_transport.dylib is actually *found* at runtime by
+#     whixp's dlopen() call. It's copied into Contents/Frameworks/ below,
+#     matching where Flutter's own embedded frameworks live and rely on the
+#     runner's existing @executable_path/../Frameworks rpath, but this is
+#     unverified - dlopen() only happens when the app actually runs, and
+#     Dart FFI dynamic loading isn't a link-time dependency, so a build can
+#     succeed even if this placement is wrong.
+#   - Screen Recording permission flow (ScreenCaptureKit).
+#   - Accessibility permission flow (enigo input injection).
+#   - Any actual capture/produce/inject behavior at runtime.
+# All of the above require manual testing on real macOS hardware.
+#
+# No code signing or notarization - this produces a local-testing-only
+# unsigned .app, not something to distribute outside the team.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build whixp_transport native library for macOS
+        run: |
+          cd native/whixp_transport
+          cargo build --release
+          ls -la target/release/*.dylib
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter build macos (debug)
+        run: flutter build macos --debug
+
+      - name: Wire whixp_transport.dylib into the built .app
+        run: |
+          APP_PATH="build/macos/Build/Products/Debug/ringopus_remote_producer.app"
+          FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
+          mkdir -p "$FRAMEWORKS_DIR"
+          cp native/whixp_transport/target/release/libwhixp_transport.dylib "$FRAMEWORKS_DIR/"
+          echo "Copied into $FRAMEWORKS_DIR - see the workflow file header for what this does and doesn't prove."
+
+      - name: Zip the .app for download
+        run: |
+          cd build/macos/Build/Products/Debug
+          zip -r ringopus_remote_producer-macos.zip ringopus_remote_producer.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ringopus_remote_producer-macos
+          path: build/macos/Build/Products/Debug/ringopus_remote_producer-macos.zip
+          retention-days: 14
