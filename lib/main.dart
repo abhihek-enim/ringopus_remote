@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'producer_home_page.dart';
 import 'src/rust/frb_generated.dart';
+import 'theme.dart';
 
 Future<void> main() async {
   await RustLib.init();
@@ -15,7 +16,7 @@ class RingopusProducerApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Ringopus Remote Producer',
-      theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo)),
+      theme: buildAppTheme(),
       home: const ProducerHomePage(),
     );
   }
