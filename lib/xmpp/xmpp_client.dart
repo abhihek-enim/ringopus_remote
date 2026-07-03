@@ -10,6 +10,15 @@ import 'constant_interval_reconnection_policy.dart';
 // be changed just because the connection target below changes.
 const String componentJid = 'orchestrator.192.168.56.101';
 
+// The orchestrator VM's bridged-adapter (enp0s9) IP is DHCP-assigned, not
+// static, so it changes on lease renewal - this has already broken
+// connectivity twice (.162 -> .8, then .8 -> .7). Update here when it
+// changes again, and update MS_ANNOUNCE_IP in the server's config.js to
+// match, or media/ICE will be wrong even if signaling connects fine.
+// The real fix is a static IP or a DHCP reservation (MAC 08:00:27:76:5b:02)
+// on the router for that adapter, so this stops moving entirely.
+const String ejabberdWsHost = '192.168.1.7';
+
 /// Dart port of the reference app's tempClient.ts, matched 1:1 against
 /// whixp 3.3.1's actual API (checked, not assumed). Presence
 /// subscribe/subscribed auto-accept and the constant-3s reconnection policy
@@ -19,15 +28,8 @@ class XmppClient {
     : _whixp = Whixp(
         jabberID: jid,
         password: password,
-        // Actual TCP/WebSocket connection target - unlike componentJid
-        // above, this DOES need to be reachable from wherever the client
-        // runs. 192.168.56.101 is a VirtualBox host-only adapter address,
-        // reachable only from the Windows machine hosting that VM,
-        // confirmed unreachable (100% ping loss) from other LAN devices
-        // like a Mac on the same WiFi. 192.168.1.8 is the VM's bridged
-        // adapter (enp0s9) - the same real LAN-reachable address already
-        // used for MS_ANNOUNCE_IP.
-        host: '192.168.1.8',
+        // Actual TCP/WebSocket connection target - see ejabberdWsHost above.
+        host: ejabberdWsHost,
         port: 5280,
         useWebSocket: true,
         wsPath: '/ws',
