@@ -1,6 +1,7 @@
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 
+import 'app_log.dart';
 import 'mediasoup/mediasoup_client.dart';
 import 'mediasoup_signaling.dart';
 import 'router_rtp_capabilities.dart';
@@ -33,7 +34,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   String _connectedJid = '';
   String _sourceName = '';
   bool _logExpanded = false;
-  final List<String> _log = [];
+  final ScrollController _logScrollController = ScrollController();
 
   @override
   void initState() {
@@ -47,14 +48,15 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _signaling.cleanup();
     _renderer.dispose();
     _stream?.dispose();
+    _logScrollController.dispose();
     super.dispose();
   }
 
-  void _appendLog(String line) {
-    // ignore: avoid_print
-    print(line);
-    if (mounted) setState(() => _log.add(line));
-  }
+  // Every print() call in the app - ours, whixp's internal traces,
+  // mediasoup's error logs - feeds AppLog via the Zone override in
+  // main.dart, so this is just a thin, readable alias for call sites here.
+  // ignore: avoid_print
+  void _appendLog(String line) => print(line);
 
   void _setPhase(_Phase phase, String status) {
     if (!mounted) return;
@@ -491,15 +493,30 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
           children: [
             Container(
               color: AppColors.surface,
-              height: 220,
+              height: 260,
               width: double.infinity,
               padding: const EdgeInsets.all(10),
-              child: ListView.builder(
-                itemCount: _log.length,
-                itemBuilder: (context, i) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 1),
-                  child: _buildLogLine(_log[i]),
-                ),
+              // Rebuilds whenever any print() happens anywhere in the app -
+              // see app_log.dart. Auto-scrolls to the newest line each time,
+              // so it reads like a live console rather than a static dump.
+              child: ListenableBuilder(
+                listenable: AppLog.instance,
+                builder: (context, _) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (_logScrollController.hasClients) {
+                      _logScrollController.jumpTo(_logScrollController.position.maxScrollExtent);
+                    }
+                  });
+                  final lines = AppLog.instance.lines;
+                  return ListView.builder(
+                    controller: _logScrollController,
+                    itemCount: lines.length,
+                    itemBuilder: (context, i) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 1),
+                      child: _buildLogLine(lines[i]),
+                    ),
+                  );
+                },
               ),
             ),
           ],
