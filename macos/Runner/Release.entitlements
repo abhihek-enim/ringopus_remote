@@ -2,13 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>com.apple.security.app-sandbox</key>
-	<true/>
-	<!-- Required for outgoing connections: the XMPP WebSocket to ejabberd
-	     (both Dart's own networking and whixp's native Rust transport) and
-	     the mediasoup WebRTC media path. Without this, App Sandbox silently
-	     blocks outbound connections rather than raising a clear error. -->
-	<key>com.apple.security.network.client</key>
-	<true/>
+	<!-- App Sandbox deliberately OFF - see DebugProfile.entitlements for why
+	     (it broke whixp's SQLite database path resolution). Keep both
+	     entitlements files in sync so a future Release build doesn't
+	     regress into the same connectionFailure loop. -->
 </dict>
 </plist>

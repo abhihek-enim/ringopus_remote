@@ -2,18 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>com.apple.security.app-sandbox</key>
-	<true/>
+	<!-- App Sandbox is deliberately OFF: this build is unsigned/unnotarized,
+	     local-testing-only (see .github/workflows/macos-build.yml), never
+	     App Store bound, so sandboxing buys nothing. It was actively
+	     breaking whixp's SQLite database: _getDatabasePath() hand-builds
+	     "$HOME/Library/Application Support/whixp" from Platform.environment,
+	     which under App Sandbox still reports the *real* home directory even
+	     though only the app's container path is actually writable - every
+	     open/create attempt was denied, initialize() threw after retries,
+	     and that exception propagated straight into a connectionFailure
+	     reconnect loop with no XMPP traffic ever sent. -->
 	<key>com.apple.security.cs.allow-jit</key>
-	<true/>
-	<key>com.apple.security.network.server</key>
-	<true/>
-	<!-- Required for outgoing connections: the XMPP WebSocket to ejabberd
-	     (both Dart's own networking and whixp's native Rust transport) and
-	     the mediasoup WebRTC media path. Without this, App Sandbox silently
-	     blocks outbound connections rather than raising a clear error -
-	     the WebSocket handshake just never completes. -->
-	<key>com.apple.security.network.client</key>
 	<true/>
 </dict>
 </plist>
