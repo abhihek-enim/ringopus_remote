@@ -76,7 +76,10 @@ class DatabaseController {
   bool _initialized = false;
 
   /// Lock for initialization to prevent race conditions.
-  final _initLock = Completer<void>();
+  /// Ringopus fix: not final - replaced with a fresh Completer after a
+  /// failed attempt so the next reconnect can retry initialization instead
+  /// of being permanently stuck on the completed lock of a failed attempt.
+  Completer<void> _initLock = Completer<void>();
   bool _isInitializing = false;
 
   /// Constructs a [DatabaseController] with an optional database path.
@@ -182,6 +185,13 @@ class DatabaseController {
       );
     } finally {
       _initLock.complete();
+      if (!_initialized) {
+        // Failed attempt: hand out a fresh lock so a later call (e.g. the
+        // next reconnect's connection-start callback) retries from scratch
+        // rather than waking on this completed lock and throwing forever.
+        _isInitializing = false;
+        _initLock = Completer<void>();
+      }
     }
   }
 

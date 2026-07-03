@@ -69,7 +69,18 @@ abstract class WhixpBase {
 
     /// [Log] instance to print out various log messages properly
     Log? logger,
-    String internalDatabasePath = '/',
+    // Ringopus fix: upstream defaulted this to '/', i.e. the filesystem
+    // ROOT. Transport passes any non-empty value straight through, so the
+    // SQLite file became /whixp_<hash>.db - which happened to work on
+    // Windows (sqlite resolved the drive-relative path into a writable
+    // directory) but always fails with permission-denied on macOS, where
+    // '/' is the read-only APFS system volume. That failure fires inside
+    // the connection-start callback, tearing down every connection attempt
+    // in an endless connected -> connectionFailure loop. Empty string means
+    // "no explicit path", which makes DatabaseController fall back to the
+    // real per-platform app-data directory (%APPDATA%, ~/Library/
+    // Application Support, ~/.local/share).
+    String internalDatabasePath = '',
     ReconnectionPolicy? reconnectionPolicy,
   }) {
     _streamNamespace = WhixpUtils.getNamespace('JABBER_STREAM');
