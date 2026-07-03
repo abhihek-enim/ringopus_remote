@@ -23,7 +23,7 @@
 // this hot path for no benefit here).
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use enigo::{
@@ -54,6 +54,21 @@ struct InputEvent {
     delta_y: Option<f64>,
 }
 
+/// Most recent injection-side failure, surfaced back through inject_input()'s
+/// Result so it reaches the Dart on-screen log. eprintln! alone is useless in
+/// a packaged .app: Rust stderr never passes through Dart's print() capture,
+/// which is how the real Enigo init error stayed invisible on macOS while the
+/// UI only showed "sending on a closed channel".
+fn last_error() -> &'static Mutex<Option<String>> {
+    static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    LAST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+fn record_error(msg: String) {
+    eprintln!("[input_inject] {msg}");
+    *last_error().lock().unwrap() = Some(msg);
+}
+
 fn injector_sender() -> &'static Sender<InputEvent> {
     static SENDER: OnceLock<Sender<InputEvent>> = OnceLock::new();
     SENDER.get_or_init(|| {
@@ -67,17 +82,31 @@ fn injector_sender() -> &'static Sender<InputEvent> {
 }
 
 fn injector_loop(rx: Receiver<InputEvent>) {
-    let mut enigo = match Enigo::new(&Settings::default()) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("[input_inject] failed to initialize Enigo: {e}");
-            return;
-        }
-    };
+    // Enigo init is lazy and retried per event rather than done once up
+    // front: on macOS Enigo::new() fails until the user grants Accessibility
+    // permission (System Settings > Privacy & Security > Accessibility).
+    // The original code returned from the thread on that first failure,
+    // dropping the Receiver - so every later send hit a closed channel
+    // forever, even after the user granted permission. Retrying lets
+    // injection come alive mid-session the moment the grant lands.
+    let mut enigo: Option<Enigo> = None;
 
     for event in rx {
-        if let Err(e) = handle_event(&mut enigo, event) {
-            eprintln!("[input_inject] error handling event: {e}");
+        if enigo.is_none() {
+            match Enigo::new(&Settings::default()) {
+                Ok(e) => enigo = Some(e),
+                Err(e) => {
+                    record_error(format!(
+                        "Enigo init failed: {e}. On macOS: System Settings > \
+                         Privacy & Security > Accessibility > enable this app, \
+                         then try again (input events are dropped until then)."
+                    ));
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = handle_event(enigo.as_mut().unwrap(), event) {
+            record_error(format!("error handling event: {e}"));
         }
     }
 }
@@ -182,5 +211,11 @@ fn map_key(key: &str) -> Option<Key> {
 /// (just a channel send); actual injection happens on the dedicated thread.
 pub fn inject_input(payload_json: String) -> Result<(), String> {
     let event: InputEvent = serde_json::from_str(&payload_json).map_err(|e| e.to_string())?;
-    injector_sender().send(event).map_err(|e| e.to_string())
+    injector_sender().send(event).map_err(|e| e.to_string())?;
+    // Surface (and clear) any error recorded by the injector thread so the
+    // real cause lands in the Dart-side log instead of a bare channel error.
+    if let Some(msg) = last_error().lock().unwrap().take() {
+        return Err(msg);
+    }
+    Ok(())
 }
