@@ -4,5 +4,11 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
+	<!-- Required for outgoing connections: the XMPP WebSocket to ejabberd
+	     (both Dart's own networking and whixp's native Rust transport) and
+	     the mediasoup WebRTC media path. Without this, App Sandbox silently
+	     blocks outbound connections rather than raising a clear error. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
 </dict>
 </plist>
