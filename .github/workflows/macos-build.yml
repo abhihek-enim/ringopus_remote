@@ -68,6 +68,17 @@ jobs:
           cp native/whixp_transport/target/release/libwhixp_transport.dylib "$FRAMEWORKS_DIR/"
           echo "Copied into $FRAMEWORKS_DIR - see the workflow file header for what this does and doesn't prove."
 
+          # whixp's Dart FFI loader does a bare `DynamicLibrary.open("libwhixp_transport.dylib")`
+          # on macOS, which resolves via the main binary's LC_RPATH (Flutter's runner already
+          # has @executable_path/../Frameworks). That only works if the dylib carries a valid
+          # signature - dropping in an unsigned file post-build, after Xcode already ad-hoc
+          # signed the .app, leaves both the dylib and the outer bundle's seal invalid. Re-sign
+          # both so App Sandbox / Gatekeeper don't have a reason to refuse the dlopen() at runtime.
+          echo "Ad-hoc signing the dylib and re-signing the .app bundle..."
+          codesign --force --sign - --timestamp=none "$FRAMEWORKS_DIR/libwhixp_transport.dylib"
+          codesign --force --deep --sign - --timestamp=none --entitlements macos/Runner/DebugProfile.entitlements "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH" && echo "codesign verify: OK"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ringopus_remote_producer-macos
