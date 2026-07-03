@@ -33,6 +33,58 @@ use enigo::{
 };
 use serde::Deserialize;
 
+/// Minimal libdispatch binding to run a closure synchronously on the main
+/// queue. macOS's Text Input Sources API (TIS/TSM) hard-asserts it is called
+/// on the main dispatch queue - dispatch_assert_queue() SIGTRAPs the whole
+/// process otherwise, it is not a catchable error. enigo's keycode lookup
+/// for layout-dependent keys (Key::Unicode, i.e. every plain character)
+/// goes through TSMGetInputSourceProperty, so calling enigo.key() from the
+/// injector thread crashed the app on the first typed character (crash
+/// report: islGetInputSourceListWithAdditions -> _dispatch_assert_queue_fail
+/// on thread "input-injector"). Mouse events use CGEvent posting only, which
+/// is thread-safe - they stay on the injector thread. Raw FFI rather than a
+/// dispatch crate: one function is not worth a new dependency.
+#[cfg(target_os = "macos")]
+mod main_thread {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct DispatchQueue {
+        _private: [u8; 0],
+    }
+
+    extern "C" {
+        static _dispatch_main_q: DispatchQueue;
+        fn dispatch_sync_f(
+            queue: *const DispatchQueue,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+
+    /// Blocks the calling thread until `f` has run on the main queue.
+    /// Because the caller is parked for the duration, handing the closure
+    /// mutable borrows from the calling thread is race-free. Must never be
+    /// called from the main thread itself (dispatch_sync would deadlock) -
+    /// the injector thread is the only caller.
+    pub fn run_sync<F: FnOnce() + Send>(f: F) {
+        extern "C" fn invoke<F: FnOnce()>(context: *mut c_void) {
+            let f = unsafe { (*(context as *mut Option<F>)).take() };
+            if let Some(f) = f {
+                f();
+            }
+        }
+        let mut f: Option<F> = Some(f);
+        unsafe {
+            dispatch_sync_f(
+                &_dispatch_main_q,
+                &mut f as *mut Option<F> as *mut c_void,
+                invoke::<F>,
+            );
+        }
+    }
+}
+
 #[flutter_rust_bridge::frb(init)]
 pub fn init_app() {
     // Default utilities - feel free to customize
@@ -159,6 +211,25 @@ fn handle_event(enigo: &mut Enigo, payload: InputEvent) -> Result<(), String> {
                 Release
             };
             if let Some(k) = payload.key.as_deref().and_then(map_key) {
+                // macOS: must run on the main queue - see the main_thread
+                // module docs. Everywhere else the direct call is fine.
+                #[cfg(target_os = "macos")]
+                {
+                    let mut err: Option<String> = None;
+                    {
+                        let enigo_ref = &mut *enigo;
+                        let err_ref = &mut err;
+                        main_thread::run_sync(move || {
+                            if let Err(e) = enigo_ref.key(k, dir) {
+                                *err_ref = Some(e.to_string());
+                            }
+                        });
+                    }
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
                 enigo.key(k, dir).map_err(|e| e.to_string())?;
             }
         }
