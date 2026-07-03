@@ -10,14 +10,11 @@ import 'constant_interval_reconnection_policy.dart';
 // be changed just because the connection target below changes.
 const String componentJid = 'orchestrator.192.168.56.101';
 
-// The orchestrator VM's bridged-adapter (enp0s9) IP is DHCP-assigned, not
-// static, so it changes on lease renewal - this has already broken
-// connectivity twice (.162 -> .8, then .8 -> .7). Update here when it
-// changes again, and update MS_ANNOUNCE_IP in the server's config.js to
-// match, or media/ICE will be wrong even if signaling connects fine.
-// The real fix is a static IP or a DHCP reservation (MAC 08:00:27:76:5b:02)
-// on the router for that adapter, so this stops moving entirely.
-const String ejabberdWsHost = '192.168.1.7';
+// Orchestrator now runs on a dedicated AWS EC2 instance with a fixed
+// public IP, replacing the old bridged-adapter VM whose DHCP lease kept
+// drifting (.162 -> .8 -> .7) and was unreachable across Wi-Fi client
+// isolation. Must match MS_ANNOUNCE_IP in the server's config.js.
+const String ejabberdWsHost = '13.50.244.139';
 
 /// Dart port of the reference app's tempClient.ts, matched 1:1 against
 /// whixp 3.3.1's actual API (checked, not assumed). Presence
