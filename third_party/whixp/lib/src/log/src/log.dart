@@ -27,11 +27,18 @@ class Log {
     /// Whether to enable info messages. Defaults to `true`
     bool enableInfo = true,
 
-    /// Whether to enable error messages. Defaults to `false`
-    bool enableError = false,
+    /// Whether to enable error messages.
+    /// Ringopus fix: upstream defaulted this to `false`, which silently
+    /// discarded every Log.instance.error() call - including the real
+    /// exception text behind connection failures ("Error in connection
+    /// start callback: ...", "Unexpected error during database
+    /// initialization: ..."). The on-screen log then only showed bare
+    /// state transitions, making failures undiagnosable in packaged
+    /// builds. Errors and warnings must be visible.
+    bool enableError = true,
 
-    /// Whether to enable warning messages. Defaults to `false`
-    bool enableWarning = false,
+    /// Whether to enable warning messages. See enableError above.
+    bool enableWarning = true,
 
     /// Whether to use native colors assigned to level types or not.
     bool nativeColors = true,
