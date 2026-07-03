@@ -106,3 +106,16 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+dependency_overrides:
+  # Vendored copy of whixp 3.1.0 (Dart source only, native/ build cache
+  # excluded - Windows/macOS never used its bundled binaries anyway, see
+  # native/whixp_transport/ which this repo builds and embeds itself).
+  # Patches a real race in DatabaseController.initialize(): _initLock used
+  # to complete() before the database was actually open, so a concurrent
+  # caller (Session.resume() reading SM state right after the stream
+  # connects) could read from a database that was never initialized. Only
+  # showed up reliably on macOS where that race window is wider; see
+  # third_party/whixp/lib/src/database/controller.dart for the fix.
+  whixp:
+    path: third_party/whixp

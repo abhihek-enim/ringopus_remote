@@ -801,10 +801,9 @@ packages:
   whixp:
     dependency: "direct main"
     description:
-      name: whixp
-      sha256: "7912720c301ab14dfc34b5050494298be8dc661db8f82cc1a94ee26775b53994"
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/whixp"
+      relative: true
+    source: path
     version: "3.1.0"
   xdg_directories:
     dependency: transitive
