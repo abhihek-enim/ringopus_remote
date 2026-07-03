@@ -300,7 +300,16 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             ),
         ],
       ),
-      body: _isConnected ? _buildConnectedBody() : _buildSignInBody(),
+      // Log panel lives outside the connected/sign-in split so it's visible
+      // from the moment the app launches - the whole point of on-screen
+      // logging is diagnosing failures that happen before/during sign-in on
+      // a packaged .app with no attached terminal (see app_log.dart).
+      body: Column(
+        children: [
+          Expanded(child: _isConnected ? _buildConnectedBody() : _buildSignInBody()),
+          _buildLogPanel(),
+        ],
+      ),
     );
   }
 
@@ -360,7 +369,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       children: [
         _buildControlRow(),
         Expanded(child: _buildPreviewArea()),
-        _buildLogPanel(),
       ],
     );
   }
