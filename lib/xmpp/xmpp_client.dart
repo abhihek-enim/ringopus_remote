@@ -13,8 +13,10 @@ const String componentJid = 'orchestrator.192.168.56.101';
 // Orchestrator now runs on a dedicated AWS EC2 instance with a fixed
 // public IP, replacing the old bridged-adapter VM whose DHCP lease kept
 // drifting (.162 -> .8 -> .7) and was unreachable across Wi-Fi client
-// isolation. Must match MS_ANNOUNCE_IP in the server's config.js.
-const String ejabberdWsHost = '13.50.244.139';
+// isolation. Relocated from eu-north-1 (Stockholm) to ap-south-1 (Mumbai)
+// to cut the India<->EU round trip out of signaling and media latency.
+// Must match MS_ANNOUNCE_IP in the server's config.js.
+const String ejabberdWsHost = '3.108.60.195';
 
 /// Dart port of the reference app's tempClient.ts, matched 1:1 against
 /// whixp 3.3.1's actual API (checked, not assumed). Presence
