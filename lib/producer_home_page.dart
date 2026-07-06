@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 
@@ -36,6 +38,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   bool _logExpanded = false;
   final ScrollController _logScrollController = ScrollController();
 
+  // Orthogonal to _Phase, not a new phase value: _Phase.sharing correctly
+  // stays true throughout hold/transfer since capture/renderer/MediaStream
+  // never stop - only whether an agent is actively watching/controlling
+  // changes.
+  bool _agentOnHold = false;
+  String? _transientBanner;
+  Timer? _transientBannerTimer;
+
   @override
   void initState() {
     super.initState();
@@ -49,7 +59,25 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _renderer.dispose();
     _stream?.dispose();
     _logScrollController.dispose();
+    _transientBannerTimer?.cancel();
     super.dispose();
+  }
+
+  void _setHold(bool held, String status) {
+    if (!mounted) return;
+    setState(() {
+      _agentOnHold = held;
+      _statusText = status;
+    });
+  }
+
+  void _showTransientBanner(String text) {
+    if (!mounted) return;
+    _transientBannerTimer?.cancel();
+    setState(() => _transientBanner = text);
+    _transientBannerTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _transientBanner = null);
+    });
   }
 
   // Every print() call in the app - ours, whixp's internal traces,
@@ -98,6 +126,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       _connectedJid = '';
       _phase = _Phase.disconnected;
       _statusText = 'Not connected';
+      _agentOnHold = false;
     });
   }
 
@@ -109,6 +138,15 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _setPhase(_Phase.connected, 'Ready — waiting for an incoming session request…');
 
       case 'session-incoming':
+        if (_phase == _Phase.sessionIncoming ||
+            _phase == _Phase.ready ||
+            _phase == _Phase.sharing) {
+          _appendLog(
+            'WARNING: session-incoming ignored — already in a session '
+            '(phase=$_phase, current sid=${_signaling.sid}, incoming sid=${msg['sid']})',
+          );
+          return;
+        }
         final sid = msg['sid'] as String;
         _appendLog('--- session-incoming from ${msg['from']} (sid=$sid) ---');
         _signaling.sid = sid;
@@ -146,7 +184,21 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
       case 'data-consumer-params':
         _appendLog('[mediasoup] data-consumer-params received — wiring input injection');
-        await _signaling.consumeData(msg);
+        await _signaling.rebindDataConsumer(msg);
+
+      case 'session-held':
+        _appendLog('--- session held (sid=${msg['sid']}) ---');
+        _signaling.pauseSending();
+        _setHold(true, 'On hold — agent stepped away');
+
+      case 'session-resumed':
+        _appendLog('--- session resumed (sid=${msg['sid']}) ---');
+        _signaling.resumeSending();
+        _setHold(false, 'Sharing "$_sourceName"');
+
+      case 'session-agent-changed':
+        _appendLog('--- new agent attached (sid=${msg['sid']}) ---');
+        _showTransientBanner('Agent connected');
 
       case 'session-error':
         _appendLog('SESSION ERROR: ${msg['reason']}');
@@ -156,6 +208,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _appendLog('--- session terminated ---');
         await _stopSharingLocally();
         _signaling.cleanup();
+        _agentOnHold = false;
         _setPhase(_Phase.connected, 'Session ended — waiting for a new request…');
 
       default:
@@ -244,6 +297,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     }
     await _stopSharingLocally();
     _signaling.cleanup();
+    _agentOnHold = false;
     _setPhase(_Phase.connected, 'Stopped — waiting for a new session request…');
   }
 
@@ -251,6 +305,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       _phase != _Phase.disconnected && _phase != _Phase.connecting && _phase != _Phase.error;
 
   Color get _statusDotColor {
+    if (_phase == _Phase.sharing && _agentOnHold) return Colors.amber;
     switch (_phase) {
       case _Phase.disconnected:
         return AppColors.textSecondary;
@@ -417,7 +472,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   };
 
   Widget _buildPreviewArea() {
-    final cornerLabel = _phase == _Phase.sharing ? _sourceName : 'Preview';
+    final onHold = _phase == _Phase.sharing && _agentOnHold;
+    final cornerLabel = onHold
+        ? 'ON HOLD'
+        : _phase == _Phase.sharing
+        ? _sourceName
+        : 'Preview';
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Container(
@@ -448,8 +508,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
               Positioned(
                 top: 10,
                 left: 10,
-                child: _buildCornerBadge(cornerLabel, live: _phase == _Phase.sharing),
+                child: _buildCornerBadge(cornerLabel, live: _phase == _Phase.sharing && !onHold),
               ),
+              if (_transientBanner != null)
+                Positioned(
+                  top: 10,
+                  right: 10,
+                  child: _buildCornerBadge(_transientBanner!, live: true),
+                ),
             ],
           ),
         ),

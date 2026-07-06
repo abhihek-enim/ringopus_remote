@@ -588,12 +588,16 @@ class UnifiedPlan extends HandlerInterface {
     // Speacial case for VP9 with SVC.
     bool hackVp9Svc = false;
 
+    // Vendored fix: scalabilityMode is nullable and callers legitimately pass
+    // encodings that only set bitrate fields (e.g. maxBitrate) — upstream's
+    // `!` here turned that into a runtime null-check crash.
     ScalabilityMode layers = ScalabilityMode.parse(
       (options.encodings.isNotEmpty
               ? options.encodings
               : [RtpEncodingParameters(scalabilityMode: '')])
           .first
-          .scalabilityMode!,
+          .scalabilityMode ??
+          '',
     );
 
     if (options.encodings.length == 1 &&

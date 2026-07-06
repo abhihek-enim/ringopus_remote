@@ -190,6 +190,7 @@ class MediasoupSignaling {
 
     transport.producerCallback = (producer) {
       _producer = producer as Producer;
+      _applySenderTuning(_producer!);
       onProducer?.call(_producer!);
     };
     transport.produce(
@@ -197,7 +198,35 @@ class MediasoupSignaling {
       stream: stream,
       source: 'screen',
       codec: codec,
+      // Without an explicit cap libwebrtc applies generic camera-call
+      // defaults (~2.5 Mbps), which smears a full desktop capture. 8 Mbps
+      // gives the encoder headroom; actual usage still adapts downward via
+      // bandwidth estimation. Merged into the SDP-derived encoding by the
+      // handler's single-encoding path and signaled to the router, so the
+      // server-side BWE allocates for it too.
+      encodings: [RtpEncodingParameters(maxBitrate: 8000000)],
     );
+  }
+
+  /// Post-produce sender tuning that can't be expressed through produce()
+  /// arguments: under CPU/bandwidth pressure prefer dropping resolution over
+  /// dropping frame rate, since a stalling frame stream is what reads as
+  /// "lag" during remote control. (flutter_webrtc 1.5.x exposes no
+  /// track.contentHint, so degradationPreference is the available knob.)
+  Future<void> _applySenderTuning(Producer producer) async {
+    final sender = producer.rtpSender;
+    if (sender == null) return;
+    try {
+      final params = sender.parameters;
+      params.degradationPreference = RTCDegradationPreference.MAINTAIN_FRAMERATE;
+      await sender.setParameters(params);
+      // ignore: avoid_print
+      print('[MediasoupSignaling] sender degradationPreference set to maintain-framerate');
+    } catch (e) {
+      // Non-fatal: platform sender may not support setParameters mid-stream.
+      // ignore: avoid_print
+      print('[MediasoupSignaling] sender tuning skipped: $e');
+    }
   }
 
   Future<MediaStream?> consumeStream(Map<String, dynamic> params) async {
@@ -294,6 +323,27 @@ class MediasoupSignaling {
       protocol: (params['protocol'] as String?) ?? '',
     );
   }
+
+  /// Closes and replaces only the data-channel consumer — used when a
+  /// different agent takes over remote-control input for this same customer
+  /// session (transfer). _sendTransport/_producer/sid (the screen-share leg)
+  /// and _recvTransport itself are untouched: a transport connects this
+  /// customer to the *server*, not to any specific agent, so only the
+  /// DataConsumer object bound to a specific agent's dataProducerId needs to
+  /// move. Safe to call even when no prior _dataConsumer exists (first attach).
+  Future<void> rebindDataConsumer(Map<String, dynamic> params) async {
+    _dataConsumer?.close();
+    _dataConsumer = null;
+    _lastMoveSeq = -1; // a new agent's input isn't comparable to the old agent's seq numbers
+    await consumeData(params);
+  }
+
+  /// Local bandwidth/CPU optimization for hold: stops the encoder from
+  /// consuming CPU while nobody is watching. Not required for correctness -
+  /// the server's own producer.pause()/consumer.pause() are what actually
+  /// stop RTP from being relayed.
+  void pauseSending() => _producer?.pause();
+  void resumeSending() => _producer?.resume();
 
   void resolveConnect(String transportId) {
     final pending = _pendingConnect[transportId];
