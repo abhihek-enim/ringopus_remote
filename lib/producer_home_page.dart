@@ -253,10 +253,35 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       return;
     }
 
+    // The desktop capturer always captures at native resolution (its macOS
+    // implementation parses only frameRate from the constraints — width/
+    // height are silently ignored), so a Retina Mac produces 5-6 MP frames
+    // that starve the 8 Mbps budget and collapse the frame rate. Wait
+    // briefly for the first frame to learn the real capture size, then have
+    // the encoder downscale to ~1080p-class output. Falls back to no
+    // scaling if no frame arrives in time (same behavior as before).
+    for (var i = 0; i < 20 && _renderer.videoWidth == 0; i++) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    var scaleDown = 1.0;
+    final capturedWidth = _renderer.videoWidth;
+    if (capturedWidth > 1920) {
+      scaleDown = capturedWidth / 1920.0;
+      _appendLog(
+        '[capture] native ${capturedWidth.toInt()}x${_renderer.videoHeight.toInt()} '
+        '— encoder downscale ${scaleDown.toStringAsFixed(2)}x to ~1920 wide',
+      );
+    } else if (capturedWidth > 0) {
+      _appendLog('[capture] native ${capturedWidth.toInt()}x${_renderer.videoHeight.toInt()} — no downscale needed');
+    } else {
+      _appendLog('[capture] WARNING: no frame within 2s — producing without downscale');
+    }
+
     await _signaling.produce(
       track: stream.getVideoTracks().first,
       stream: stream,
       codec: h264,
+      scaleResolutionDownBy: scaleDown,
       onProducer: (producer) {
         _appendLog('--- Producer created: ${producer.id} ---');
         _logCodecParity(producer.rtpParameters);

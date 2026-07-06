@@ -173,10 +173,17 @@ class MediasoupSignaling {
   /// Produces [track] on the send transport, forcing [codec] (mediasoup's
   /// Ortc.reduceCodecs() otherwise silently defaults to the router's first
   /// listed codec - see the Phase 2 VP8-vs-H264 finding).
+  ///
+  /// [scaleResolutionDownBy] shrinks the encoded output relative to the
+  /// captured size (encoder-side downscale). The macOS desktop capturer
+  /// ignores width/height constraints entirely - only frameRate is parsed
+  /// (verified in flutter_webrtc 1.5.2's FlutterRTCDesktopCapturer.m) - so
+  /// this is the only working resolution knob on that path.
   Future<void> produce({
     required MediaStreamTrack track,
     required MediaStream stream,
     required RtpCodecCapability codec,
+    double scaleResolutionDownBy = 1.0,
     void Function(Producer producer)? onProducer,
   }) async {
     final transport = _sendTransport;
@@ -204,7 +211,20 @@ class MediasoupSignaling {
       // bandwidth estimation. Merged into the SDP-derived encoding by the
       // handler's single-encoding path and signaled to the router, so the
       // server-side BWE allocates for it too.
-      encodings: [RtpEncodingParameters(maxBitrate: 8000000)],
+      //
+      // maxFramerate makes the 30fps target explicit at the encoder, and
+      // scaleResolutionDownBy (when > 1) shrinks the encoded frames so the
+      // bitrate budget isn't starved by a native-Retina capture - starvation
+      // makes libwebrtc's screencast adaptation collapse the frame rate,
+      // which is exactly what reads as interaction lag on the agent side.
+      encodings: [
+        RtpEncodingParameters(
+          maxBitrate: 8000000,
+          maxFramerate: 30,
+          scaleResolutionDownBy:
+              scaleResolutionDownBy > 1.0 ? scaleResolutionDownBy : null,
+        ),
+      ],
     );
   }
 
