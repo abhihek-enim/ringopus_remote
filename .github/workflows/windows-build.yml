@@ -1,0 +1,76 @@
+name: Windows build (installer)
+
+# Builds the Flutter Windows release and packages it into a single
+# RingopusRemoteSetup.exe via the NSIS script in installer/, then publishes
+# it to the same rolling "latest" release used by macos-build.yml (alongside
+# the .dmg from that workflow).
+#
+# GitHub's windows-latest runner already ships the MSVC/CMake/Ninja toolchain
+# flutter build windows needs, so - unlike the macOS workflow - there's no
+# native-library cross-compilation step here: windows/CMakeLists.txt's own
+# `cargo build --release` custom command (see PROVENANCE.md in
+# native/whixp_transport/) builds whixp_transport.dll as part of the normal
+# `flutter build windows` invocation, same as it does on a dev machine.
+#
+# Note: both this workflow and macos-build.yml write to the same "latest"
+# release tag and each set their own `body:` text unconditionally, so the
+# release description reflects whichever workflow ran most recently. That's
+# cosmetic only - each workflow's `files:` list is additive, so the other
+# OS's asset is never touched/removed.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # needed to create/update the "latest" release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter build windows (release)
+        run: flutter build windows --release
+
+      - name: Ensure NSIS is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            choco install nsis -y
+          }
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /VERSION
+
+      - name: Build installer (makensis)
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\NSIS\makensis.exe" installer\installer.nsi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ringopus_remote_producer-windows-setup
+          path: installer/Output/RingopusRemoteSetup.exe
+          retention-days: 14
+
+      - name: Publish/update the "latest" release with the setup .exe
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: Latest build (unsigned, testing only)
+          body: |
+            Automated unsigned Windows build from commit ${{ github.sha }}.
+            Installs via a standard NSIS setup wizard (or silently with
+            `RingopusRemoteSetup.exe /S`); supports upgrade-over and clean
+            uninstall from Windows "Apps & Features".
+          files: installer/Output/RingopusRemoteSetup.exe
