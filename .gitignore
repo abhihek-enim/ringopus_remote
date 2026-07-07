@@ -62,3 +62,9 @@ ehthumbs.db
 # whixp's session-storage sqlite db, created in the working directory at
 # runtime since we haven't set an explicit internalDatabasePath.
 whixp_*.db
+
+# Local working/handoff docs — kept out of the repo because they carry
+# operational detail (server IPs, IAM/instance ids, test-account creds,
+# session-state handoff notes) that shouldn't live in shared version control.
+CLAUDE.md
+DECISIONS.md
