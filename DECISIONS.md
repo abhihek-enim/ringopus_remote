@@ -118,6 +118,54 @@ The Dart client used for mediasoup transports, producers, and consumers (`lib/me
 
 ---
 
+### Bug: interaction lag — root cause was pipeline starvation, not the relay — 2026-07-07
+
+**Problem:** after the 2026-07-05 three-repo latency fix, remote control still felt very laggy: input events landed on the customer instantly, but the video feedback ran hundreds of ms behind.
+
+**Diagnosis (the key logical step):** input and video traverse the *same* Mumbai SFU in opposite directions. Instant input + laggy video therefore rules out the network path as the dominant cost — the lag lives in the video pipeline. The chain: the desktop capturer captures at native Retina resolution (~5–6 MP) unconstrained; 8 Mbps is starvation-level for that size; under starvation libwebrtc's *screencast* adaptation sacrifices **frame rate**, not resolution; low fps (each interaction waits up to ~200 ms just to be captured) plus huge bursty frames inflate the receiver's adaptive jitter buffer (`jitterBufferTarget = 0` is only a hint) by another ~100–250 ms.
+
+**Verified capturer fact:** flutter_webrtc 1.5.2's desktop capturers parse **only `frameRate`** from `getDisplayMedia` constraints — width/height are silently ignored (checked in `FlutterRTCDesktopCapturer.m`). Resolution can only be controlled at the encoder.
+
+**Fix (this repo):** `_produce()` waits ≤2 s for the first frame on the preview renderer to learn the true capture size, then passes `scaleResolutionDownBy` (targeting ~1920-wide encoded output) and an explicit `maxFramerate: 30` — both confirmed marshaled through flutter_webrtc's darwin native layer, so neither silently no-ops. The on-screen log line `[capture] native WxH — encoder downscale …` confirms engagement at runtime.
+
+**Agent-side counterparts (in `ringopus_user_app`):** direct `<video>` rendering replaced a `requestAnimationFrame`+`drawImage` canvas mirror (removing ~16–33 ms + vsync-quantized sampling); the video `Consumer` is now retained and a 1 s `getStats` poller logs `[VideoStats] fps/res/jb/dec/rtt/rate` — the attribution line for any remaining lag.
+
+**Consequence / next decision gate:** if `[VideoStats]` shows fps ≥ 25 and jb < 50 ms during interaction yet lag persists, the residual is relay RTT — the then-justified next step is a customer-region-colocated SFU router. **Not pure P2P**: hold/transfer hard-depends on the SFU's stable-producer/swap-consumer model.
+
+---
+
+### Decision: agent renders a local cursor — pointer feedback decoupled from the video pipeline — 2026-07-07
+
+**Problem:** the agent's only pointer feedback was the remote cursor image baked into the video (the agent UI deliberately set `cursor: none`), so every mouse movement was felt at full glass-to-glass latency. The cursor is what the eye locks onto; pointer lag *is* perceived lag.
+
+**Fix (the standard remote-desktop trick):** the agent now shows its own local cursor (crosshair) at native input latency; because input injection uses absolute normalized coordinates, the remote cursor always converges on the local one. The Windows-native producer additionally excludes the cursor from capture (`scap` `show_cursor: false`), making the local cursor the only one on that path.
+
+**Limitation on this repo's path:** flutter_webrtc 1.5.2 **hardcodes `showsCursor = YES`** in its macOS ScreenCaptureKit capturer (`macos/Classes/FlutterScreenCaptureKitCapturer.m:61`) with no Dart-side control — the macOS customer's stream keeps the remote cursor, so agents see their instant crosshair plus a trailing remote arrow. Removing it means forking/patching the flutter_webrtc native plugin (or a future version exposing it). Deliberately deferred.
+
+---
+
+## Session Lifecycle — Hold & Transfer (customer side)
+
+### Decision: the customer is purely reactive in the agent hold/transfer protocol — 2026-07-06
+
+Agents can put a session on hold/resume it, or transfer it to another agent picked from a live roster — with the customer's screen share never dropping. The server (orchestrator) and agent implementation live in `ringopus_user_app` (`server/sessionHandlers.js`, `server/agentRegistry.js`, `useRemoteSession.ts`); this repo only *reacts*: `session-held` → `pauseSending()` + amber "ON HOLD" badge; `session-resumed` → `resumeSending()`; `session-agent-changed` → transient "Agent connected" banner; a re-sent `data-consumer-params` → `rebindDataConsumer()`. The customer never initiates any of it and is never re-prompted for consent on transfer.
+
+Hold state is an **orthogonal flag (`_agentOnHold`) on top of `_Phase.sharing`, not a new phase** — capture/renderer/producer stay alive throughout; only whether an agent is watching changes. `pauseSending`/`resumeSending` are the first real call sites of the vendored `Producer.pause()/resume()`.
+
+### Decision: transfer swaps only the input leg — `rebindDataConsumer` partial teardown — 2026-07-06
+
+A `WebRtcTransport` connects this customer to the *server*, not to any specific agent — so when a different agent takes over, nothing about the screen-share leg (`_sendTransport`/`_producer`/`sid`) or even `_recvTransport` itself needs to change. `rebindDataConsumer()` closes only the `DataConsumer` object (bound to the old agent's `dataProducerId`), resets `_lastMoveSeq` (a new agent's input sequence isn't comparable to the old one's), and consumes the new params. `cleanup()` remains the full-teardown path for genuine session end; don't conflate the two.
+
+### Bug: `session-incoming` had no phase guard — a second incoming session silently clobbered a live one — 2026-07-06
+
+**Problem:** the `session-incoming` handler ran identically regardless of `_phase` — including mid-`sharing`. A second incoming session overwrote `_signaling.sid` in place, auto-accepted, and switched the UI away, while the original session's transports/producer stayed open but unreachable (never `.close()`d — a real leak).
+
+**Fix:** the handler now ignores (with a logged warning) any `session-incoming` arriving during `sessionIncoming`/`ready`/`sharing`. Load-bearing counterpart on the server: `handleSessionRequest` rejects requests targeting an already-in-session customer with `session-error: target-busy`, so the requesting agent gets a proper error instead of silence.
+
+**Consequence:** transfer-related events reach the customer via *distinct* message types (`session-agent-changed`, re-sent `data-consumer-params`) — never via a second `session-incoming`. Any future protocol change must preserve that distinction or the guard will eat it.
+
+---
+
 ## Input Injection
 
 ### Bug: stale mousemove replay over the unreliable data channel — 2026-07-02
