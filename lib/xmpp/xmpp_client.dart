@@ -33,6 +33,11 @@ class XmppClient {
         useWebSocket: true,
         wsPath: '/ws',
         reconnectionPolicy: ConstantIntervalReconnectionPolicy(),
+        // Default is 300s (Whixp's own constructor default, which overrides
+        // Transport's 180s field default) - too coarse a cadence to notice a
+        // dead socket promptly. Tightened for network-drop detection; see
+        // DECISIONS.md.
+        pingKeepAliveInterval: 30,
       ) {
     _registerEvents();
   }
@@ -42,6 +47,7 @@ class XmppClient {
   void Function(String jid)? onConnected;
   void Function()? onAuthFailed;
   void Function(Map<String, dynamic> msg)? onComponentMessage;
+  void Function(TransportState state)? onStateChanged;
 
   void _registerEvents() {
     _whixp.addEventHandler('streamNegotiated', (_) {
@@ -54,6 +60,7 @@ class XmppClient {
     _whixp.addEventHandler<TransportState>('state', (state) {
       // ignore: avoid_print
       print('[XMPP] state: $state');
+      if (state != null) onStateChanged?.call(state);
     });
 
     // Real event name/type confirmed from whixp's SASL feature source

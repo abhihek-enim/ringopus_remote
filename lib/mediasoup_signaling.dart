@@ -30,6 +30,14 @@ class MediasoupSignaling {
 
   void Function(Map<String, dynamic> payload)? onDataMessage;
 
+  // ICE-derived connection state for whichever transport just changed -
+  // label is 'send'/'recv', state is 'connecting'/'connected'/'failed'/
+  // 'disconnected'/'closed' (see Transport._handleHandler's
+  // '@connectionstatechange' -> 'connectionstatechange' re-emit). Drives
+  // network-drop detection in producer_home_page.dart; this class only
+  // reports the raw signal, it doesn't interpret severity itself.
+  void Function(String label, String connectionState)? onTransportStateChanged;
+
   Function? _pendingProduceCb;
   Timer? _pendingProduceTimer;
 
@@ -81,6 +89,13 @@ class MediasoupSignaling {
     _sendTransport = transport;
     // ignore: avoid_print
     print('[MediasoupSignaling] send transport created: ${transport.id}');
+
+    transport.on('connectionstatechange', (data) {
+      final state = (data as Map)['connectionState'] as String;
+      // ignore: avoid_print
+      print('[MediasoupSignaling] send transport connectionstatechange: $state');
+      onTransportStateChanged?.call('send', state);
+    });
 
     transport.on('connect', (data) {
       // ignore: avoid_print
@@ -146,6 +161,13 @@ class MediasoupSignaling {
     _recvTransport = transport;
     // ignore: avoid_print
     print('[MediasoupSignaling] recv transport created: ${transport.id}');
+
+    transport.on('connectionstatechange', (data) {
+      final state = (data as Map)['connectionState'] as String;
+      // ignore: avoid_print
+      print('[MediasoupSignaling] recv transport connectionstatechange: $state');
+      onTransportStateChanged?.call('recv', state);
+    });
 
     transport.on('connect', (data) {
       // ignore: avoid_print
@@ -397,7 +419,7 @@ class MediasoupSignaling {
     }
   }
 
-  void cleanup() {
+  Future<void> cleanup() async {
     _pendingProduceTimer?.cancel();
     _pendingProduceDataTimer?.cancel();
     for (final p in _pendingConnect.values) {
@@ -410,11 +432,16 @@ class MediasoupSignaling {
     _pendingProduceDataTimer = null;
     _lastMoveSeq = -1;
 
+    // Producer/DataProducer/DataConsumer.close() are synchronous (void);
+    // only Transport.close() (and Consumer.close(), not held here) actually
+    // return Future<void> - awaiting those two is what makes cleanup()
+    // actually wait for the underlying RTCPeerConnection/handler teardown
+    // instead of firing-and-forgetting it.
     _producer?.close();
     _dataProducer?.close();
     _dataConsumer?.close();
-    _sendTransport?.close();
-    _recvTransport?.close();
+    await _sendTransport?.close();
+    await _recvTransport?.close();
     _producer = null;
     _dataProducer = null;
     _dataConsumer = null;

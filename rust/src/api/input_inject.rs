@@ -22,6 +22,7 @@
 // Mutex (which would also be valid given Send, but adds lock contention on
 // this hot path for no benefit here).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -83,6 +84,75 @@ mod main_thread {
             );
         }
     }
+}
+
+/// Raw FFI to user32's ShowCursor, hiding/restoring the native OS cursor for
+/// the duration of a remote-control session (the agent's own crosshair
+/// overlay is the only pointer feedback meant to be visible - see
+/// DECISIONS.md's "agent renders a local cursor" entry). Same "raw FFI, not
+/// a new crate dependency" convention as the macOS `main_thread` module
+/// above: ShowCursor is one function, not worth pulling in the `windows` or
+/// `winapi` crate for.
+///
+/// Known caveat: ShowCursor's display counter is maintained per-thread by
+/// Windows. If flutter_rust_bridge ever dispatches this call from a
+/// different OS thread on each invocation, hide()/show() could under- or
+/// over-shoot the counter relative to whichever thread actually owns the
+/// desktop's cursor rendering. Verify this visibly hides/restores the
+/// cursor at runtime, not just that the FFI call returns without error - if
+/// it doesn't, the next step is a WH_MOUSE_LL hook or a dedicated
+/// message-pump thread, not more calls to this same function.
+#[cfg(target_os = "windows")]
+pub(crate) mod win_cursor {
+    #[link(name = "user32")]
+    extern "system" {
+        fn ShowCursor(bshow: i32) -> i32;
+    }
+
+    pub fn hide() {
+        unsafe {
+            while ShowCursor(0) >= 0 {}
+        }
+    }
+
+    pub fn show() {
+        unsafe {
+            while ShowCursor(1) < 0 {}
+        }
+    }
+}
+
+/// Hides the native OS cursor for the duration of an active session
+/// (Windows only for now - see DECISIONS.md, macOS to follow). Idempotent.
+pub fn hide_cursor() {
+    #[cfg(target_os = "windows")]
+    win_cursor::hide();
+}
+
+/// Restores the native OS cursor. Idempotent - safe to call unconditionally
+/// on every session-end path, including abnormal termination, so a crash or
+/// dropped connection never leaves the cursor hidden.
+pub fn show_cursor() {
+    #[cfg(target_os = "windows")]
+    win_cursor::show();
+}
+
+/// Whether the injector thread should act on queued events. Cleared between
+/// sessions (teardown) so a stale in-flight event can't be injected after a
+/// session has ended, and set again at the start of a new one. Does not
+/// stop or recreate the injector thread itself - it's process-lifetime by
+/// design (see the module doc comment above) - this just makes it inert.
+static INJECTION_ARMED: AtomicBool = AtomicBool::new(true);
+
+/// Arms the input injector for a new session. Idempotent.
+pub fn start_input_injection() {
+    INJECTION_ARMED.store(true, Ordering::SeqCst);
+}
+
+/// Disarms the input injector - queued/incoming events are dropped instead
+/// of reaching enigo until the next `start_input_injection()`. Idempotent.
+pub fn stop_input_injection() {
+    INJECTION_ARMED.store(false, Ordering::SeqCst);
 }
 
 #[flutter_rust_bridge::frb(init)]
@@ -164,6 +234,9 @@ fn injector_loop(rx: Receiver<InputEvent>) {
 }
 
 fn handle_event(enigo: &mut Enigo, payload: InputEvent) -> Result<(), String> {
+    if !INJECTION_ARMED.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     match payload.event_type.as_str() {
         "mousemove" => {
             let (screen_w, screen_h) = enigo.main_display().map_err(|e| e.to_string())?;
