@@ -10,7 +10,8 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `InputEvent`
 
 /// Hides the native OS cursor for the duration of an active session
-/// (Windows only for now - see DECISIONS.md, macOS to follow). Idempotent.
+/// (Windows only for now - see DECISIONS.md, macOS to follow; a no-op
+/// elsewhere). Idempotent.
 Future<void> hideCursor() =>
     RustLib.instance.api.crateApiInputInjectHideCursor();
 

@@ -102,6 +102,15 @@ mod main_thread {
 /// cursor at runtime, not just that the FFI call returns without error - if
 /// it doesn't, the next step is a WH_MOUSE_LL hook or a dedicated
 /// message-pump thread, not more calls to this same function.
+///
+/// Defined unconditionally (a no-op stub on non-Windows) rather than
+/// `#[cfg(target_os = "windows")]`-gating the whole module: flutter_rust_
+/// bridge's codegen inlines hide_cursor()/show_cursor()'s single-statement
+/// bodies directly into frb_generated.rs *without* preserving the cfg gate
+/// that was on the call site inside them (confirmed - it broke the macOS CI
+/// build, which compiles frb_generated.rs unconditionally). Keeping the
+/// module itself platform-unconditional means that generated call always
+/// resolves, regardless of what the codegen does or doesn't inline.
 #[cfg(target_os = "windows")]
 pub(crate) mod win_cursor {
     #[link(name = "user32")]
@@ -122,10 +131,16 @@ pub(crate) mod win_cursor {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+pub(crate) mod win_cursor {
+    pub fn hide() {}
+    pub fn show() {}
+}
+
 /// Hides the native OS cursor for the duration of an active session
-/// (Windows only for now - see DECISIONS.md, macOS to follow). Idempotent.
+/// (Windows only for now - see DECISIONS.md, macOS to follow; a no-op
+/// elsewhere). Idempotent.
 pub fn hide_cursor() {
-    #[cfg(target_os = "windows")]
     win_cursor::hide();
 }
 
@@ -133,7 +148,6 @@ pub fn hide_cursor() {
 /// on every session-end path, including abnormal termination, so a crash or
 /// dropped connection never leaves the cursor hidden.
 pub fn show_cursor() {
-    #[cfg(target_os = "windows")]
     win_cursor::show();
 }
 
