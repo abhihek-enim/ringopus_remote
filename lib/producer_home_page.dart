@@ -31,12 +31,15 @@ enum _Phase { disconnected, connecting, connected, sessionIncoming, ready, shari
 // trying to recover" instead of new phases).
 enum _TeardownReason { userRequested, remoteTerminated, xmppUnrecoverable, mediasoupUnrecoverable, appDisposed }
 
-// Bounded-recovery tunables for the mediasoup/ICE drop path. Not measured
-// against real network conditions yet - see the plan's Verification section.
-const Duration _mediasoupIceGracePeriod = Duration(seconds: 5);
-const Duration _mediasoupRecoveryAckTimeout = Duration(seconds: 5);
-const Duration _mediasoupRecoveryRetrySpacing = Duration(seconds: 2);
-const int _maxMediasoupRecoveryAttempts = 3;
+// Reconnection tunables for the mediasoup/ICE drop path. The recovery model is
+// ICE restart (preserves the producer, so the agent's video resumes on its own)
+// against the orchestrator's restart-ice handler. Not measured against real
+// network conditions yet - see the plan's Verification section.
+const Duration _mediasoupIceGracePeriod = Duration(seconds: 5); // ICE 'disconnected' self-heal window before acting
+const Duration _mediasoupRecoveryResendCadence = Duration(seconds: 4); // re-send restart-ice this often while still down
+const Duration _mediasoupReconnectWindow = Duration(seconds: 30); // overall give-up deadline once ICE drops
+// Aligned to the mediasoup window so a pure-XMPP death gives up on the same ~30s
+// budget; the server holds the session ~45s (a longer backstop) either way.
 const Duration _xmppUnrecoverableWindow = Duration(seconds: 30);
 
 class _ProducerHomePageState extends State<ProducerHomePage> {
@@ -69,12 +72,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   // close together.
   bool _tearingDown = false;
   bool _xmppReconnecting = false;
+  bool _xmppConnected = false; // gates mediasoup recovery — restart-ice can't travel while XMPP is down
   Timer? _xmppUnrecoverableTimer;
   bool _mediasoupRecovering = false;
-  final Map<String, Timer> _mediasoupGraceTimers = {};
-  final Map<String, Timer> _mediasoupRecoveryTimers = {};
-  final Map<String, int> _mediasoupRecoveryAttempts = {};
-  final Map<String, int> _mediasoupCurrentAttemptId = {};
+  final Map<String, Timer> _mediasoupGraceTimers = {}; // per-label ICE-'disconnected' grace
+  final Map<String, Timer> _mediasoupRecoveryTimers = {}; // per-label restart-ice resend cadence
+  final Map<String, int> _mediasoupCurrentAttemptId = {}; // per-label, for discarding stale restart-ice-params
+  final Set<String> _mediasoupNeedingRecovery = {}; // labels ('send'/'recv') currently dropped and being recovered
+  Timer? _mediasoupReconnectDeadline; // single overall give-up timer for the whole reconnect episode
 
   @override
   void initState() {
@@ -139,6 +144,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _xmpp = xmpp;
     xmpp.onConnected = (boundJid) {
       _appendLog('[xmpp] connected as $boundJid');
+      _xmppConnected = true; // stream is negotiated/bound — restart-ice can now travel
       setState(() => _connectedJid = boundJid);
       _setPhase(_Phase.connected, 'Connected — requesting router capabilities…');
       xmpp.sendToComponent({'type': 'get-router-caps'});
@@ -155,6 +161,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
   Future<void> _disconnect() async {
     await _teardownSession(reason: _TeardownReason.userRequested, notifyPeer: true);
+    _xmppConnected = false;
     _xmpp?.disconnect();
     _xmpp = null;
     if (!mounted) return;
@@ -243,15 +250,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _appendLog('--- session terminated ---');
         await _teardownSession(reason: _TeardownReason.remoteTerminated, notifyPeer: false);
 
-      // Response to a client-initiated 'renegotiate-transports' request (see
-      // _runMediasoupRecoveryAttempt) - NOT YET SENT BY THE ORCHESTRATOR
-      // TODAY; this handler is the client's half of a protocol extension
-      // that needs matching server-side support (see the plan's
-      // Coordination Notes). 'attemptId' must be echoed back unchanged so a
-      // stale/late reply from a superseded attempt can be told apart from
-      // the current one.
-      case 'renegotiate-transport-params':
-        await _onRenegotiateTransportParams(msg);
+      // Orchestrator's reply to a client-initiated 'restart-ice' request:
+      // fresh iceParameters for the customer's send/recv transport. 'attemptId'
+      // is echoed back unchanged so a stale/late reply from a superseded resend
+      // can be discarded.
+      case 'restart-ice-params':
+        _onRestartIceParams(msg);
 
       default:
         _appendLog('[xmpp] unhandled message type: ${msg['type']}');
@@ -375,6 +379,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   void _cancelAllDropTimers() {
     _xmppUnrecoverableTimer?.cancel();
     _xmppUnrecoverableTimer = null;
+    _mediasoupReconnectDeadline?.cancel();
+    _mediasoupReconnectDeadline = null;
     for (final t in _mediasoupGraceTimers.values) {
       t.cancel();
     }
@@ -383,10 +389,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       t.cancel();
     }
     _mediasoupRecoveryTimers.clear();
-    // A session torn down mid-recovery (e.g. 2 of 3 attempts already used)
-    // must not leave a fresh future session inheriting a stale attempt
-    // count/attemptId and getting fewer real retries.
-    _mediasoupRecoveryAttempts.clear();
+    // A session torn down mid-recovery must not leave a fresh future session
+    // inheriting stale recovery bookkeeping (needing-recovery labels or
+    // attemptId watermarks).
+    _mediasoupNeedingRecovery.clear();
     _mediasoupCurrentAttemptId.clear();
   }
 
@@ -439,10 +445,17 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     if (_tearingDown) return;
     switch (state) {
       case TransportState.connected:
+        _xmppConnected = true;
         _xmppUnrecoverableTimer?.cancel();
         _xmppUnrecoverableTimer = null;
         if (_xmppReconnecting && mounted) {
           setState(() => _xmppReconnecting = false);
+        }
+        // XMPP is the transport for restart-ice signaling. Any mediasoup
+        // recovery that was waiting for XMPP to come back can now fire
+        // immediately, rather than idling until its next cadence tick.
+        for (final label in _mediasoupNeedingRecovery.toList()) {
+          _pumpMediasoupRecovery(label);
         }
       case TransportState.connectionFailure:
       case TransportState.reconnecting:
@@ -452,6 +465,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         // recover from. whixp's own reconnection policy + XEP-0198 resume
         // already self-heal brief blips with zero app involvement; only
         // escalate if this drags on past the grace window below.
+        _xmppConnected = false;
         if (_xmppUnrecoverableTimer == null) {
           if (mounted) setState(() => _xmppReconnecting = true);
           _xmppUnrecoverableTimer = Timer(_xmppUnrecoverableWindow, _declareXmppUnrecoverable);
@@ -473,114 +487,105 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     if (_tearingDown) return;
     switch (state) {
       case 'connected':
+        // ICE (re)connected for this transport. If it was in recovery, it's
+        // now healed - the restart-ice actually worked. Clear its recovery
+        // bookkeeping; if nothing else is still dropped, the whole episode is
+        // over.
         _mediasoupGraceTimers.remove(label)?.cancel();
-        _mediasoupRecoveryAttempts.remove(label);
+        _mediasoupRecoveryTimers.remove(label)?.cancel();
         _mediasoupCurrentAttemptId.remove(label);
-        if (_mediasoupRecoveryAttempts.isEmpty && _mediasoupRecovering && mounted) {
-          setState(() => _mediasoupRecovering = false);
+        if (_mediasoupNeedingRecovery.remove(label)) {
+          _appendLog('[recovery] $label reconnected');
+        }
+        if (_mediasoupNeedingRecovery.isEmpty) {
+          _mediasoupReconnectDeadline?.cancel();
+          _mediasoupReconnectDeadline = null;
+          if (_mediasoupRecovering && mounted) {
+            setState(() => _mediasoupRecovering = false);
+          }
         }
       case 'disconnected':
-        // ICE's own transient state - can self-heal (ICE renegotiation/
-        // trickle) without app involvement, mirroring XMPP's SM-resume
-        // tolerance above. Give it a short grace window before treating it
-        // as a confirmed drop.
+        // ICE's own transient state - can self-heal (ICE trickle/keepalive)
+        // without app involvement, mirroring XMPP's SM-resume tolerance. Give
+        // it a short grace window before treating it as a confirmed drop.
         _mediasoupGraceTimers[label]?.cancel();
         _mediasoupGraceTimers[label] = Timer(_mediasoupIceGracePeriod, () {
           if (_tearingDown) return;
-          unawaited(_attemptMediasoupRecovery(label));
+          _beginMediasoupRecovery(label);
         });
       case 'failed':
       case 'closed':
         _mediasoupGraceTimers.remove(label)?.cancel();
-        unawaited(_attemptMediasoupRecovery(label));
+        _beginMediasoupRecovery(label);
       default:
       // 'connecting' - no action.
     }
   }
 
-  Future<void> _attemptMediasoupRecovery(String label) async {
+  /// Enter (or re-enter) ICE-restart recovery for one transport. Recovery is a
+  /// single episode bounded by one overall deadline; per-label it re-sends
+  /// restart-ice on a cadence until that transport reports 'connected' again or
+  /// the deadline fires.
+  void _beginMediasoupRecovery(String label) {
     if (_tearingDown) return;
-    if (_mediasoupRecoveryAttempts.containsKey(label)) return; // already in flight
+    if (!_mediasoupNeedingRecovery.add(label)) return; // already recovering this label
     if (mounted) setState(() => _mediasoupRecovering = true);
-    _mediasoupRecoveryAttempts[label] = 0;
-    _runMediasoupRecoveryAttempt(label);
+    // One deadline governs the whole episode (both transports usually drop
+    // together on a real network blip); don't restart it per-label.
+    _mediasoupReconnectDeadline ??= Timer(_mediasoupReconnectWindow, _onMediasoupReconnectDeadline);
+    _pumpMediasoupRecovery(label);
   }
 
-  void _runMediasoupRecoveryAttempt(String label) {
+  /// Sends one restart-ice for [label] (only if XMPP is actually up — the
+  /// request can't travel otherwise, and burning the budget on a dead channel
+  /// is exactly the bug this gating fixes), then re-arms itself on a cadence.
+  /// When XMPP comes back, _onXmppStateChanged re-pumps immediately instead of
+  /// waiting for the next tick.
+  void _pumpMediasoupRecovery(String label) {
     if (_tearingDown) return;
-    final attempt = (_mediasoupRecoveryAttempts[label] ?? 0) + 1;
-    _mediasoupRecoveryAttempts[label] = attempt;
-    final attemptId = (_mediasoupCurrentAttemptId[label] ?? 0) + 1;
-    _mediasoupCurrentAttemptId[label] = attemptId;
-
-    _appendLog('[recovery] $label attempt $attempt/$_maxMediasoupRecoveryAttempts (attemptId=$attemptId)');
-    _xmpp?.sendToComponent({
-      'type': 'renegotiate-transports',
-      'sid': _signaling.sid,
-      'direction': label,
-      'attemptId': attemptId,
-    });
-
+    if (!_mediasoupNeedingRecovery.contains(label)) return; // already reconnected
+    if (_xmppConnected) {
+      final attemptId = (_mediasoupCurrentAttemptId[label] ?? 0) + 1;
+      _mediasoupCurrentAttemptId[label] = attemptId;
+      _appendLog('[recovery] restart-ice $label (attemptId=$attemptId)');
+      _xmpp?.sendToComponent({
+        'type': 'restart-ice',
+        'sid': _signaling.sid,
+        'direction': label,
+        'attemptId': attemptId,
+      });
+    } else {
+      _appendLog('[recovery] $label waiting for XMPP before restart-ice');
+    }
     _mediasoupRecoveryTimers[label]?.cancel();
-    _mediasoupRecoveryTimers[label] = Timer(_mediasoupRecoveryAckTimeout, () {
-      if (_tearingDown) return;
-      if (_mediasoupCurrentAttemptId[label] != attemptId) return; // superseded by a later attempt
-      if (attempt >= _maxMediasoupRecoveryAttempts) {
-        _onMediasoupRecoveryExhausted(label);
-      } else {
-        Timer(_mediasoupRecoveryRetrySpacing, () {
-          if (_tearingDown) return;
-          if (_mediasoupCurrentAttemptId[label] != attemptId) return;
-          _runMediasoupRecoveryAttempt(label);
-        });
-      }
-    });
+    _mediasoupRecoveryTimers[label] = Timer(
+      _mediasoupRecoveryResendCadence,
+      () => _pumpMediasoupRecovery(label),
+    );
   }
 
-  void _onMediasoupRecoveryExhausted(String label) {
+  void _onMediasoupReconnectDeadline() {
     if (_tearingDown) return;
-    _appendLog('[recovery] $label exhausted retries — tearing down session');
+    _appendLog('[recovery] reconnect window elapsed — tearing down session');
     unawaited(_teardownSession(reason: _TeardownReason.mediasoupUnrecoverable, notifyPeer: true));
   }
 
-  /// Handles the orchestrator's reply to a client-initiated
-  /// 'renegotiate-transports' request. See the case in _onComponentMessage
-  /// for the protocol-coordination caveat - the orchestrator doesn't send
-  /// this message today.
-  Future<void> _onRenegotiateTransportParams(Map<String, dynamic> msg) async {
+  /// Applies the orchestrator's fresh iceParameters to the existing transport.
+  /// Success isn't declared here - we wait for that transport's
+  /// 'connectionstatechange' → 'connected' (in _onMediasoupStateChanged) to
+  /// confirm the restart actually took; if it didn't, the cadence keeps
+  /// retrying and the deadline governs.
+  void _onRestartIceParams(Map<String, dynamic> msg) {
+    if (_tearingDown) return;
     final label = msg['direction'] as String;
     final attemptId = msg['attemptId'] as int;
     if (_mediasoupCurrentAttemptId[label] != attemptId) {
-      _appendLog(
-        '[recovery] discarding stale renegotiate-transport-params for $label '
-        '(attemptId=$attemptId, current=${_mediasoupCurrentAttemptId[label]})',
-      );
+      _appendLog('[recovery] discarding stale restart-ice-params for $label (attemptId=$attemptId)');
       return;
     }
-    if (_tearingDown) return;
-    _mediasoupRecoveryTimers.remove(label)?.cancel();
-    try {
-      final transportParams = msg['transport'] as Map<String, dynamic>;
-      if (label == 'send') {
-        await _signaling.createSendTransport(transportParams);
-        await _produce(); // recreates the producer against the still-alive capture track
-      } else {
-        await _signaling.createRecvTransport(transportParams);
-        final dataConsumerParams = msg['dataConsumer'] as Map<String, dynamic>?;
-        if (dataConsumerParams != null) {
-          await _signaling.rebindDataConsumer(dataConsumerParams);
-        }
-      }
-      _mediasoupRecoveryAttempts.remove(label);
-      _mediasoupCurrentAttemptId.remove(label);
-      if (_mediasoupRecoveryAttempts.isEmpty && mounted) {
-        setState(() => _mediasoupRecovering = false);
-      }
-      _appendLog('[recovery] $label recovered');
-    } catch (e) {
-      _appendLog('[recovery] $label recreation failed: $e');
-      _onMediasoupRecoveryExhausted(label);
-    }
+    if (!_mediasoupNeedingRecovery.contains(label)) return; // already reconnected
+    _signaling.restartIce(label, msg['iceParameters'] as Map<String, dynamic>);
+    _appendLog('[recovery] applied restart-ice for $label — awaiting reconnect');
   }
 
   bool get _isConnected =>

@@ -387,6 +387,22 @@ class MediasoupSignaling {
   void pauseSending() => _producer?.pause();
   void resumeSending() => _producer?.resume();
 
+  /// Restarts ICE on the still-open send/recv transport after a network blip,
+  /// using fresh iceParameters the orchestrator returned from its own
+  /// WebRtcTransport.restartIce(). This preserves the producer/consumer (unlike
+  /// a full transport rebuild), so the agent's video resumes without any
+  /// agent-side change. Transport.restartIce enqueues on the transport's flex
+  /// queue (sync) and no-ops if the transport never completed its initial
+  /// connect. Mirrors rebindDataConsumer() in reaching a private transport
+  /// field via a small public method.
+  void restartIce(String label, Map<String, dynamic> iceParametersJson) {
+    final transport = label == 'send' ? _sendTransport : _recvTransport;
+    if (transport == null) return;
+    transport.restartIce(IceParameters.fromMap(iceParametersJson));
+    // ignore: avoid_print
+    print('[MediasoupSignaling] restartIce applied to $label transport');
+  }
+
   void resolveConnect(String transportId) {
     final pending = _pendingConnect[transportId];
     if (pending == null) return;
