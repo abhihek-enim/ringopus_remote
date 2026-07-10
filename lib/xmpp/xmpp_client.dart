@@ -8,7 +8,13 @@ import 'constant_interval_reconnection_policy.dart';
 // a served vhost regardless of which network interface accepts the
 // connection, so it does NOT need to be a reachable address and must not
 // be changed just because the connection target below changes.
-const String componentJid = 'orchestrator.192.168.56.101';
+const String componentJid = 'orchestrator.ringopus';
+
+// Anonymous-only vhost for customer sessions (see the guest-code flow in
+// producer_home_page.dart). ejabberd's host_config for this vhost advertises
+// SASL ANONYMOUS as the sole mechanism, which is what makes whixp's
+// automatic mechanism selection pick it - whixp has no app-level override.
+const String guestVhost = 'guest.ringopus';
 
 // Orchestrator now runs on a dedicated AWS EC2 instance with a fixed
 // public IP, replacing the old bridged-adapter VM whose DHCP lease kept
@@ -41,6 +47,11 @@ class XmppClient {
       ) {
     _registerEvents();
   }
+
+  /// Guest/anonymous connection: domain-only JID against the anonymous-only
+  /// vhost, empty password (SASL ANONYMOUS needs no credentials). ejabberd
+  /// assigns a random throwaway JID that evaporates on disconnect.
+  XmppClient.guest() : this(guestVhost, '');
 
   final Whixp _whixp;
 

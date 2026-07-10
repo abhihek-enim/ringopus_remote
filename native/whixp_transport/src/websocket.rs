@@ -64,10 +64,25 @@ where
             })?;
             match msg {
                 Message::Text(_) | Message::Binary(_) => {
-                    self.read_buf = msg.into_data().to_vec();
+                    let data = msg.into_data().to_vec();
+                    // An empty text frame is a server keepalive, not
+                    // end-of-stream. Falling through with an empty buffer
+                    // would return Ok(0), which the read loop treats as EOF
+                    // and tears the whole connection down.
+                    if data.is_empty() {
+                        return self.read(buf);
+                    }
+                    self.read_buf = data;
                     self.read_pos = 0;
                 }
-                Message::Close(_) | Message::Frame(_) => return Ok(0),
+                Message::Close(cf) => {
+                    eprintln!("[Whixp] ws close frame from server: {:?}", cf);
+                    return Ok(0);
+                }
+                Message::Frame(_) => {
+                    eprintln!("[Whixp] ws unexpected raw frame");
+                    return Ok(0);
+                }
                 Message::Ping(_) | Message::Pong(_) => return self.read(buf),
             }
         }

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:whixp/whixp.dart' show TransportState;
 
 import 'app_log.dart';
@@ -57,6 +58,22 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   bool _logExpanded = false;
   final ScrollController _logScrollController = ScrollController();
 
+  // Guest-code flow (the default entry path): the app connects anonymously
+  // to guest.ringopus, asks the orchestrator for a short pairing code, and
+  // the agent redeems that code instead of dialing a JID. The legacy
+  // JID/password sign-in survives behind the "Advanced" toggle below.
+  bool _guestMode = false;
+  String _guestCode = ''; // raw digits; rendered grouped XXX-XXX-XXX
+  bool _showLegacyLogin = false;
+
+  // Consent gate for session-incoming: nothing is accepted until the
+  // customer clicks Allow. Auto-declines after a minute so an unanswered
+  // prompt doesn't strand the agent's request forever.
+  bool _consentPending = false;
+  String _pendingSessionFrom = '';
+  Timer? _consentTimer;
+  static const Duration _consentTimeout = Duration(seconds: 60);
+
   // Orthogonal to _Phase, not a new phase value: _Phase.sharing correctly
   // stays true throughout hold/transfer since capture/renderer/MediaStream
   // never stop - only whether an agent is actively watching/controlling
@@ -86,6 +103,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     super.initState();
     _renderer.initialize();
     _signaling.onTransportStateChanged = _onMediasoupStateChanged;
+    // Guest flow is the default: connect anonymously on launch so the
+    // customer sees their pairing code without any sign-in step.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _phase == _Phase.disconnected) _connectGuest();
+    });
   }
 
   @override
@@ -101,6 +123,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _renderer.dispose();
     _logScrollController.dispose();
     _transientBannerTimer?.cancel();
+    _consentTimer?.cancel();
     super.dispose();
   }
 
@@ -140,7 +163,16 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     final password = _passwordController.text;
     if (jid.isEmpty || password.isEmpty) return;
 
-    final xmpp = XmppClient(jid, password);
+    _guestMode = false;
+    _startXmpp(XmppClient(jid, password));
+  }
+
+  void _connectGuest() {
+    _guestMode = true;
+    _startXmpp(XmppClient.guest());
+  }
+
+  void _startXmpp(XmppClient xmpp) {
     _xmpp = xmpp;
     xmpp.onConnected = (boundJid) {
       _appendLog('[xmpp] connected as $boundJid');
@@ -151,7 +183,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     };
     xmpp.onAuthFailed = () {
       _appendLog('[xmpp] AUTH FAILED');
-      _setPhase(_Phase.error, 'Login failed — check JID/password');
+      _setPhase(
+        _Phase.error,
+        _guestMode
+            ? 'Could not start a guest session — check the server'
+            : 'Login failed — check JID/password',
+      );
     };
     xmpp.onComponentMessage = _onComponentMessage;
     xmpp.onStateChanged = _onXmppStateChanged;
@@ -177,7 +214,24 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'router-rtp-capabilities':
         await _signaling.loadDevice(msg['rtpCapabilities'] as Map<String, dynamic>);
         _appendLog('[mediasoup] device loaded from real router-rtp-capabilities');
-        _setPhase(_Phase.connected, 'Ready — waiting for an incoming session request…');
+        if (_guestMode) {
+          _setPhase(_Phase.connected, 'Requesting your share code…');
+          _xmpp?.sendToComponent({'type': 'guest-code-request'});
+        } else {
+          _setPhase(_Phase.connected, 'Ready — waiting for an incoming session request…');
+        }
+
+      case 'guest-code':
+        _appendLog('[guest] share code received (expires in ${msg['ttlMs']}ms)');
+        if (mounted) setState(() => _guestCode = msg['code'] as String);
+        if (_phase == _Phase.connected) {
+          _setPhase(_Phase.connected, 'Share your code with the agent to begin');
+        }
+
+      case 'guest-code-expired':
+        _appendLog('[guest] share code expired — requesting a fresh one');
+        if (mounted) setState(() => _guestCode = '');
+        _xmpp?.sendToComponent({'type': 'guest-code-request'});
 
       case 'session-incoming':
         if (_phase == _Phase.sessionIncoming ||
@@ -191,18 +245,27 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         }
         final sid = msg['sid'] as String;
         _appendLog('--- session-incoming from ${msg['from']} (sid=$sid) ---');
-        _signaling.sid = sid;
-        _signaling.sendToComponent = _xmpp!.sendToComponent;
         if (_signaling.device == null) {
           _appendLog('ERROR: session-incoming before device loaded');
           return;
         }
-        _xmpp!.sendToComponent({
-          'type': 'session-accept',
-          'sid': sid,
-          'rtpCapabilities': routerRtpCapabilitiesJson,
+        _signaling.sid = sid;
+        _signaling.sendToComponent = _xmpp!.sendToComponent;
+        // Consent gate: the session proceeds only after the customer clicks
+        // Allow (which sends the session-accept the old code sent here
+        // unconditionally). Decline sends session-reject, which the server
+        // already handles.
+        _consentTimer?.cancel();
+        _consentTimer = Timer(_consentTimeout, () {
+          if (_consentPending) _declinePendingSession(auto: true);
         });
-        _setPhase(_Phase.sessionIncoming, 'Session accepted — setting up transports…');
+        if (mounted) {
+          setState(() {
+            _consentPending = true;
+            _pendingSessionFrom = (msg['from'] as String?) ?? '';
+          });
+        }
+        _setPhase(_Phase.sessionIncoming, 'Incoming session request');
 
       case 'transport-params':
         final send = msg['send'] as Map<String, dynamic>;
@@ -262,6 +325,47 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     }
   }
 
+  void _acceptPendingSession() {
+    if (!_consentPending || _xmpp == null) return;
+    _consentTimer?.cancel();
+    setState(() => _consentPending = false);
+    _xmpp!.sendToComponent({
+      'type': 'session-accept',
+      'sid': _signaling.sid,
+      'rtpCapabilities': routerRtpCapabilitiesJson,
+    });
+    _setPhase(_Phase.sessionIncoming, 'Session accepted — setting up transports…');
+  }
+
+  void _declinePendingSession({bool auto = false}) {
+    if (!_consentPending) return;
+    _consentTimer?.cancel();
+    _xmpp?.sendToComponent({
+      'type': 'session-reject',
+      'sid': _signaling.sid,
+      'reason': auto ? 'timeout' : 'declined',
+    });
+    _signaling.sid = '';
+    if (mounted) {
+      setState(() {
+        _consentPending = false;
+        _pendingSessionFrom = '';
+      });
+    }
+    _setPhase(_Phase.connected, auto ? 'Request timed out' : 'Request declined');
+    // The code was consumed when the agent's request created the session -
+    // the customer needs a fresh one for the next attempt.
+    _refreshGuestCode();
+  }
+
+  /// Requests a replacement pairing code. The server invalidates any prior
+  /// pending code for this JID, so this is always safe to call when idle.
+  void _refreshGuestCode() {
+    if (!_guestMode || _xmpp == null || !_xmppConnected) return;
+    if (mounted) setState(() => _guestCode = '');
+    _xmpp!.sendToComponent({'type': 'guest-code-request'});
+  }
+
   Future<void> _startCapture() async {
     final source = await showDialog<DesktopCapturerSource>(
       context: context,
@@ -273,7 +377,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       final stream = await navigator.mediaDevices.getDisplayMedia({
         'video': {
           'deviceId': {'exact': source.id},
+          // frameRate must live under 'mandatory' as a plain number — the
+          // Windows/darwin capturers parse only video.mandatory.frameRate.
           'mandatory': {'frameRate': 30.0},
+          // Vendored-plugin patch (Windows screen capture): excludes the
+          // sharer's cursor from the captured frame. No-op on window capture.
+          'cursor': 'never',
         },
       });
       _stream = stream;
@@ -281,8 +390,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       setState(() => _sourceName = source.name);
       _setPhase(_Phase.sharing, 'Sharing “${source.name}”');
       _tearingDown = false; // fresh session - re-arm the teardown choke point
-      await hideCursor();
-      await startInputInjection();
+      // Input injection is independent of video capture/produce - a Rust
+      // bridge failure here (e.g. a debug-build content-hash mismatch) must
+      // not abort screen sharing, which doesn't depend on it at all.
+      try {
+        await startInputInjection();
+      } catch (e) {
+        _appendLog('startInputInjection failed (input injection unavailable this session): $e');
+      }
       await _produce();
     } catch (e) {
       _appendLog('Capture failed: $e');
@@ -404,9 +519,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   /// path are independent triggers that can fire close together.
   ///
   /// Ordering note: _stopSharingLocally() is called first (before the
-  /// showCursor()/stopInputInjection() awaits) specifically so that when
-  /// this is invoked via unawaited(...) from dispose(), its synchronous
-  /// first line (_renderer.srcObject = null) still runs before dispose()
+  /// stopInputInjection() await) specifically so that when this is invoked
+  /// via unawaited(...) from dispose(), its synchronous first line
+  /// (_renderer.srcObject = null) still runs before dispose()
   /// proceeds to _renderer.dispose() a few lines later - see dispose()'s own
   /// comment. Dart async functions run synchronously up to their first
   /// await, so anything placed after an earlier await in this function
@@ -422,20 +537,29 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       } catch (_) {}
     }
     await _stopSharingLocally();
-    await showCursor();
-    await stopInputInjection();
+    // A Rust bridge failure here must not skip the rest of teardown
+    // (signaling cleanup, timer cancellation, phase reset) - those are all
+    // independent of input injection.
+    try {
+      await stopInputInjection();
+    } catch (e) {
+      _appendLog('stopInputInjection failed: $e');
+    }
     await _signaling.cleanup();
     _agentOnHold = false;
     _xmppReconnecting = false;
     _mediasoupRecovering = false;
+    _consentTimer?.cancel();
+    _consentPending = false;
+    _pendingSessionFrom = '';
     _cancelAllDropTimers();
     if (mounted) {
-      _setPhase(
-        reason == _TeardownReason.userRequested || reason == _TeardownReason.remoteTerminated
-            ? _Phase.connected
-            : _Phase.error,
-        _statusTextFor(reason),
-      );
+      final backToIdle =
+          reason == _TeardownReason.userRequested || reason == _TeardownReason.remoteTerminated;
+      _setPhase(backToIdle ? _Phase.connected : _Phase.error, _statusTextFor(reason));
+      // Back on the idle screen: the old code is gone (consumed when this
+      // session was created), so fetch a fresh one for the next agent.
+      if (backToIdle) _refreshGuestCode();
     }
   }
 
@@ -650,9 +774,72 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       // a packaged .app with no attached terminal (see app_log.dart).
       body: Column(
         children: [
-          Expanded(child: _isConnected ? _buildConnectedBody() : _buildSignInBody()),
+          Expanded(child: _isConnected ? _buildConnectedBody() : _buildStartBody()),
           _buildLogPanel(),
         ],
+      ),
+    );
+  }
+
+  Widget _buildStartBody() =>
+      _showLegacyLogin ? _buildSignInBody() : _buildGuestStartBody();
+
+  /// Default entry screen: no credentials, just the guest session spinning
+  /// up (it auto-starts on launch). Errors land here with a retry button;
+  /// the legacy JID/password card stays reachable via the Advanced toggle.
+  Widget _buildGuestStartBody() {
+    final connecting = _phase == _Phase.connecting;
+    return Center(
+      child: SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Card(
+            margin: const EdgeInsets.all(24),
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('Ringopus Remote', style: Theme.of(context).textTheme.titleLarge),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Get a share code and read it to your support agent.',
+                    style: TextStyle(color: AppColors.textSecondary),
+                  ),
+                  const SizedBox(height: 24),
+                  if (connecting)
+                    const Center(
+                      child: Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(strokeWidth: 2.5),
+                        ),
+                      ),
+                    )
+                  else
+                    FilledButton(
+                      onPressed: _connectGuest,
+                      child: Text(_phase == _Phase.error ? 'Retry' : 'Get a share code'),
+                    ),
+                  if (_phase == _Phase.error) ...[
+                    const SizedBox(height: 12),
+                    Text(_statusText, style: const TextStyle(color: AppColors.danger)),
+                  ],
+                  const SizedBox(height: 16),
+                  TextButton(
+                    onPressed: connecting
+                        ? null
+                        : () => setState(() => _showLegacyLogin = true),
+                    child: const Text('Advanced: sign in with JID'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -699,6 +886,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                     const SizedBox(height: 12),
                     Text(_statusText, style: const TextStyle(color: AppColors.danger)),
                   ],
+                  const SizedBox(height: 16),
+                  TextButton(
+                    onPressed: _phase == _Phase.connecting
+                        ? null
+                        : () => setState(() => _showLegacyLogin = false),
+                    child: const Text('Back to guest session'),
+                  ),
                 ],
               ),
             ),
@@ -760,6 +954,116 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _Phase.error => _statusText,
   };
 
+  String get _formattedGuestCode {
+    final d = _guestCode;
+    if (d.length != 9) return d;
+    return '${d.substring(0, 3)}-${d.substring(3, 6)}-${d.substring(6)}';
+  }
+
+  /// What fills the preview box when there's no video: the share code while
+  /// idle in guest mode, the Allow/Decline consent card while a request is
+  /// pending, or the plain status text otherwise.
+  Widget _buildPreviewPlaceholder() {
+    if (_phase == _Phase.sessionIncoming && _consentPending) {
+      final agentName = _pendingSessionFrom.split('@').first;
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.screen_share_outlined, size: 40, color: AppColors.textSecondary),
+            const SizedBox(height: 16),
+            Text(
+              agentName.isEmpty
+                  ? 'An agent wants to view your screen'
+                  : '"$agentName" wants to view your screen',
+              style: Theme.of(context).textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'They will see your screen and control your mouse and keyboard.',
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 20),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                OutlinedButton(
+                  onPressed: _declinePendingSession,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppColors.danger,
+                    side: const BorderSide(color: AppColors.danger),
+                  ),
+                  child: const Text('Decline'),
+                ),
+                const SizedBox(width: 12),
+                FilledButton(
+                  onPressed: _acceptPendingSession,
+                  child: const Text('Allow'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_phase == _Phase.connected && _guestMode) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'Your share code',
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+            ),
+            const SizedBox(height: 10),
+            if (_guestCode.isEmpty)
+              const SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.5),
+              )
+            else
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SelectableText(
+                    _formattedGuestCode,
+                    style: appMonoStyle(fontSize: 34, fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    tooltip: 'Copy code',
+                    icon: const Icon(Icons.copy_rounded, size: 20),
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: _guestCode));
+                      _showTransientBanner('Code copied');
+                    },
+                  ),
+                ],
+              ),
+            const SizedBox(height: 10),
+            Text(
+              'Read this code to your support agent to start a session.',
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Center(
+      child: Text(
+        _previewPlaceholderText,
+        style: TextStyle(color: AppColors.textSecondary),
+        textAlign: TextAlign.center,
+      ),
+    );
+  }
+
   Widget _buildPreviewArea() {
     final onHold = _phase == _Phase.sharing && _agentOnHold;
     final cornerLabel = onHold
@@ -785,13 +1089,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                   color: AppColors.background,
                   child: _phase == _Phase.sharing
                       ? RTCVideoView(_renderer, mirror: false)
-                      : Center(
-                          child: Text(
-                            _previewPlaceholderText,
-                            style: TextStyle(color: AppColors.textSecondary),
-                            textAlign: TextAlign.center,
-                          ),
-                        ),
+                      : _buildPreviewPlaceholder(),
                 ),
               ),
               Positioned(

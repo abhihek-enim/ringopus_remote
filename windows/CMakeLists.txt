@@ -67,11 +67,15 @@ include(flutter/generated_plugins.cmake)
 set(WHIXP_NATIVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../native/whixp_transport")
 set(WHIXP_NATIVE_DLL "${WHIXP_NATIVE_DIR}/target/release/whixp_transport.dll")
 
+# DEPENDS must list every crate source, not just lib.rs — otherwise editing
+# e.g. stanza.rs leaves a stale DLL in the bundle (cargo itself would rebuild,
+# but this custom command never re-runs to invoke it).
+file(GLOB WHIXP_NATIVE_SOURCES "${WHIXP_NATIVE_DIR}/src/*.rs")
 add_custom_command(
   OUTPUT "${WHIXP_NATIVE_DLL}"
   COMMAND cargo build --release
   WORKING_DIRECTORY "${WHIXP_NATIVE_DIR}"
-  DEPENDS "${WHIXP_NATIVE_DIR}/Cargo.toml" "${WHIXP_NATIVE_DIR}/src/lib.rs"
+  DEPENDS "${WHIXP_NATIVE_DIR}/Cargo.toml" ${WHIXP_NATIVE_SOURCES}
   COMMENT "Building whixp_transport native library (cargo build --release)"
   VERBATIM
 )

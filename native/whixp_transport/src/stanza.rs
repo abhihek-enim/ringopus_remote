@@ -67,6 +67,18 @@ const SELF_CLOSING_ROOT: &[&str] = &[
     "r", "a", // XEP-0198 ack request/response
     "enabled", "failed", "resumed", "enable", "resume",  // XEP-0198
     "proceed", // TLS
+    // SASL success is self-closing (<success xmlns='...'/>) for mechanisms
+    // with no additional data — ANONYMOUS and PLAIN. SCRAM's success carries
+    // the server verifier and uses a real closing tag, which is why this was
+    // never hit before ANONYMOUS support. (Safe alongside the closing-tag
+    // scan: take_next_stanza always prefers the leftmost end, so a
+    // non-self-closing <success>data</success> still splits correctly.)
+    "success",
+    // RFC 7395 websocket framing: <open .../> and <close .../> are always
+    // self-closing. Without these, a stream restart's <open/> reply is only
+    // delivered when it happens to be coalesced with the features element in
+    // the same read.
+    "open", "close",
 ];
 
 impl Default for StreamFramer {
