@@ -7,7 +7,6 @@
 // ignore_for_file: argument_type_not_assignable
 
 import 'api/input_inject.dart';
-import 'api/input_inject/win_cursor.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'frb_generated.dart';

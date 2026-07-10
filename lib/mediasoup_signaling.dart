@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:collection/collection.dart';
+
 import 'mediasoup/mediasoup_client.dart';
 import 'src/rust/api/input_inject.dart';
 
@@ -43,6 +45,14 @@ class MediasoupSignaling {
 
   Function? _pendingProduceDataCb;
   Timer? _pendingProduceDataTimer;
+
+  // Diagnostic pass for the session-start quality ramp-up (see DECISIONS.md
+  // and the reconnection-adjacent plan) - not gated behind a feature flag,
+  // since it's cheap (1/s) and useful for any future latency debugging, same
+  // as the agent's existing [VideoStats] poller.
+  Timer? _senderStatsTimer;
+  int? _prevSenderBytesSent;
+  double? _prevSenderStatsTimestampMs;
 
   final Map<String, _ConnectPending> _pendingConnect = {};
 
@@ -220,6 +230,7 @@ class MediasoupSignaling {
     transport.producerCallback = (producer) {
       _producer = producer as Producer;
       _applySenderTuning(_producer!);
+      _startSenderStatsPoller(_producer!);
       onProducer?.call(_producer!);
     };
     transport.produce(
@@ -227,6 +238,17 @@ class MediasoupSignaling {
       stream: stream,
       source: 'screen',
       codec: codec,
+      // videoGoogleStartBitrate hints the encoder to start near full quality
+      // instead of libwebrtc's ~300kbps BWE cold-start default - confirmed via
+      // [SenderStats] on a live session: qualityLimitationReason=='bandwidth'
+      // for the entire startup ramp (res climbing 640x360 -> 1280x720 over
+      // hundreds of frames). This is a HINT, not a guaranteed startup bitrate -
+      // actual bitrate is still governed by TWCC/BWE. Deliberately no min/max
+      // bitrate hints here: a floor stacked on MAINTAIN_RESOLUTION below risks
+      // fighting a genuinely constrained link into packet loss instead of
+      // graceful degradation, and the existing maxBitrate encoding param
+      // already caps the ceiling.
+      codecOptions: ProducerCodecOptions(videoGoogleStartBitrate: 5000),
       // Without an explicit cap libwebrtc applies generic camera-call
       // defaults (~2.5 Mbps), which smears a full desktop capture. 8 Mbps
       // gives the encoder headroom; actual usage still adapts downward via
@@ -251,24 +273,82 @@ class MediasoupSignaling {
   }
 
   /// Post-produce sender tuning that can't be expressed through produce()
-  /// arguments: under CPU/bandwidth pressure prefer dropping resolution over
-  /// dropping frame rate, since a stalling frame stream is what reads as
-  /// "lag" during remote control. (flutter_webrtc 1.5.x exposes no
+  /// arguments. Was MAINTAIN_FRAMERATE (prefer dropping resolution over fps,
+  /// since a stalling frame stream reads as "lag" during remote control) -
+  /// switched to MAINTAIN_RESOLUTION (2026-07-09): confirmed via live
+  /// [SenderStats] that the session-start blurry-ramp was BWE-cold-start
+  /// driven (qualityLimitationReason=='bandwidth'), which the
+  /// videoGoogleStartBitrate hint above now addresses directly - so the
+  /// original tradeoff (MAINTAIN_FRAMERATE's resolution collapse under low
+  /// startup BWE) is no longer the dominant cost, and prioritizing sharp/
+  /// readable text matters more for a desktop-sharing use case than holding
+  /// fps under genuine sustained pressure. (flutter_webrtc 1.5.x exposes no
   /// track.contentHint, so degradationPreference is the available knob.)
   Future<void> _applySenderTuning(Producer producer) async {
     final sender = producer.rtpSender;
     if (sender == null) return;
     try {
       final params = sender.parameters;
-      params.degradationPreference = RTCDegradationPreference.MAINTAIN_FRAMERATE;
+      params.degradationPreference = RTCDegradationPreference.MAINTAIN_RESOLUTION;
       await sender.setParameters(params);
       // ignore: avoid_print
-      print('[MediasoupSignaling] sender degradationPreference set to maintain-framerate');
+      print('[MediasoupSignaling] sender degradationPreference set to maintain-resolution');
     } catch (e) {
       // Non-fatal: platform sender may not support setParameters mid-stream.
       // ignore: avoid_print
       print('[MediasoupSignaling] sender tuning skipped: $e');
     }
+  }
+
+  /// Diagnostic pass for the session-start quality ramp-up: logs the
+  /// outbound-rtp video stats WebRTC itself attributes the encoder's
+  /// resolution/bitrate choices to (qualityLimitationReason in particular -
+  /// 'bandwidth' confirms the BWE-cold-start hypothesis, 'cpu' would mean a
+  /// completely different fix is needed). actualBitrate isn't a native stats
+  /// field - computed as a bytesSent delta over the poll interval, same
+  /// pattern as the agent's existing [VideoStats] rate= line.
+  void _startSenderStatsPoller(Producer producer) {
+    _senderStatsTimer?.cancel();
+    _prevSenderBytesSent = null;
+    _prevSenderStatsTimestampMs = null;
+    final sender = producer.rtpSender;
+    if (sender == null) return;
+    _senderStatsTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      try {
+        final reports = await sender.getStats();
+        final outbound = reports.firstWhereOrNull(
+          (r) => r.type == 'outbound-rtp' && r.values['kind'] == 'video',
+        );
+        if (outbound == null) return;
+        final v = outbound.values;
+        final bytesSent = (v['bytesSent'] as num?)?.toInt();
+        final tsMs = outbound.timestamp;
+        String actualBitrateKbps = '?';
+        if (bytesSent != null &&
+            _prevSenderBytesSent != null &&
+            _prevSenderStatsTimestampMs != null) {
+          final dtSec = (tsMs - _prevSenderStatsTimestampMs!) / 1000.0;
+          if (dtSec > 0) {
+            actualBitrateKbps =
+                (((bytesSent - _prevSenderBytesSent!) * 8) / 1000 / dtSec).toStringAsFixed(0);
+          }
+        }
+        _prevSenderBytesSent = bytesSent;
+        _prevSenderStatsTimestampMs = tsMs;
+        // ignore: avoid_print
+        print(
+          '[SenderStats] qLimit=${v['qualityLimitationReason']} '
+          'qLimitDur=${v['qualityLimitationDurations']} '
+          'target=${v['targetBitrate']}bps actual=${actualBitrateKbps}kbps '
+          'res=${v['frameWidth']}x${v['frameHeight']} '
+          'framesEncoded=${v['framesEncoded']} '
+          'encoder=${v['encoderImplementation']}',
+        );
+      } catch (e) {
+        // ignore: avoid_print
+        print('[SenderStats] poll failed: $e');
+      }
+    });
   }
 
   Future<MediaStream?> consumeStream(Map<String, dynamic> params) async {
@@ -438,6 +518,10 @@ class MediasoupSignaling {
   Future<void> cleanup() async {
     _pendingProduceTimer?.cancel();
     _pendingProduceDataTimer?.cancel();
+    _senderStatsTimer?.cancel();
+    _senderStatsTimer = null;
+    _prevSenderBytesSent = null;
+    _prevSenderStatsTimestampMs = null;
     for (final p in _pendingConnect.values) {
       p.timer.cancel();
     }

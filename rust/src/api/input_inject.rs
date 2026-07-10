@@ -86,70 +86,12 @@ mod main_thread {
     }
 }
 
-/// Raw FFI to user32's ShowCursor, hiding/restoring the native OS cursor for
-/// the duration of a remote-control session (the agent's own crosshair
-/// overlay is the only pointer feedback meant to be visible - see
-/// DECISIONS.md's "agent renders a local cursor" entry). Same "raw FFI, not
-/// a new crate dependency" convention as the macOS `main_thread` module
-/// above: ShowCursor is one function, not worth pulling in the `windows` or
-/// `winapi` crate for.
-///
-/// Known caveat: ShowCursor's display counter is maintained per-thread by
-/// Windows. If flutter_rust_bridge ever dispatches this call from a
-/// different OS thread on each invocation, hide()/show() could under- or
-/// over-shoot the counter relative to whichever thread actually owns the
-/// desktop's cursor rendering. Verify this visibly hides/restores the
-/// cursor at runtime, not just that the FFI call returns without error - if
-/// it doesn't, the next step is a WH_MOUSE_LL hook or a dedicated
-/// message-pump thread, not more calls to this same function.
-///
-/// Defined unconditionally (a no-op stub on non-Windows) rather than
-/// `#[cfg(target_os = "windows")]`-gating the whole module: flutter_rust_
-/// bridge's codegen inlines hide_cursor()/show_cursor()'s single-statement
-/// bodies directly into frb_generated.rs *without* preserving the cfg gate
-/// that was on the call site inside them (confirmed - it broke the macOS CI
-/// build, which compiles frb_generated.rs unconditionally). Keeping the
-/// module itself platform-unconditional means that generated call always
-/// resolves, regardless of what the codegen does or doesn't inline.
-#[cfg(target_os = "windows")]
-pub(crate) mod win_cursor {
-    #[link(name = "user32")]
-    extern "system" {
-        fn ShowCursor(bshow: i32) -> i32;
-    }
-
-    pub fn hide() {
-        unsafe {
-            while ShowCursor(0) >= 0 {}
-        }
-    }
-
-    pub fn show() {
-        unsafe {
-            while ShowCursor(1) < 0 {}
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) mod win_cursor {
-    pub fn hide() {}
-    pub fn show() {}
-}
-
-/// Hides the native OS cursor for the duration of an active session
-/// (Windows only for now - see DECISIONS.md, macOS to follow; a no-op
-/// elsewhere). Idempotent.
-pub fn hide_cursor() {
-    win_cursor::hide();
-}
-
-/// Restores the native OS cursor. Idempotent - safe to call unconditionally
-/// on every session-end path, including abnormal termination, so a crash or
-/// dropped connection never leaves the cursor hidden.
-pub fn show_cursor() {
-    win_cursor::show();
-}
+// The sharer's cursor is now excluded from the captured video at the source,
+// via a `cursor: 'never'` getDisplayMedia constraint honored by the vendored
+// flutter_webrtc patch (see pubspec.yaml / DECISIONS.md). The earlier attempt
+// to hide the OS cursor from Rust (user32 ShowCursor) was removed: ShowCursor's
+// counter is per-thread and flutter_rust_bridge runs the call off the UI
+// thread, so it never visibly hid anything.
 
 /// Whether the injector thread should act on queued events. Cleared between
 /// sessions (teardown) so a stale in-flight event can't be injected after a

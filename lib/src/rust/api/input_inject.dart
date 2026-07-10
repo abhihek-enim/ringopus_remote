@@ -9,18 +9,6 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 // These functions are ignored because they are not marked as `pub`: `handle_event`, `injector_loop`, `injector_sender`, `last_error`, `map_key`, `record_error`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `InputEvent`
 
-/// Hides the native OS cursor for the duration of an active session
-/// (Windows only for now - see DECISIONS.md, macOS to follow; a no-op
-/// elsewhere). Idempotent.
-Future<void> hideCursor() =>
-    RustLib.instance.api.crateApiInputInjectHideCursor();
-
-/// Restores the native OS cursor. Idempotent - safe to call unconditionally
-/// on every session-end path, including abnormal termination, so a crash or
-/// dropped connection never leaves the cursor hidden.
-Future<void> showCursor() =>
-    RustLib.instance.api.crateApiInputInjectShowCursor();
-
 /// Arms the input injector for a new session. Idempotent.
 Future<void> startInputInjection() =>
     RustLib.instance.api.crateApiInputInjectStartInputInjection();

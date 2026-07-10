@@ -119,3 +119,16 @@ dependency_overrides:
   # third_party/whixp/lib/src/database/controller.dart for the fix.
   whixp:
     path: third_party/whixp
+  # Vendored copy of flutter_webrtc 1.5.2 (source only; the 28MB libwebrtc
+  # prebuilt is still downloaded at build time by its own CMake, gitignored).
+  # Single patch: common/cpp/src/flutter_screen_capture.cc's GetDisplayMedia
+  # now reads a `cursor: 'never'` video constraint and passes showCursor=false
+  # into CreateDesktopCapturer — stock flutter_webrtc (all versions incl. main)
+  # hardcodes it to true, so the sharer's cursor is always baked into the
+  # captured video. showCursor=false makes libwebrtc composite the screen
+  # WITHOUT the cursor (via DesktopAndCursorComposer::CreateWithoutMouseCursor-
+  # Monitor), leaving the sharer's *local* cursor untouched. Windows screen-
+  # capture only — window capture always composites the cursor upstream; macOS
+  # ScreenCaptureKit is a separate hardcoded path. See DECISIONS.md.
+  flutter_webrtc:
+    path: third_party/flutter_webrtc
