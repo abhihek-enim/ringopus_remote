@@ -33,6 +33,7 @@
 
 - (void)startCaptureWithFPS:(NSInteger)fps
                    sourceId:(NSString* _Nullable)sourceId
+                 showCursor:(BOOL)showCursor
                   onStarted:(void (^)(NSError * _Nullable error))onStarted {
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
   if (@available(macOS 12.3, *)) {
@@ -57,8 +58,15 @@
       config.height = display.height;
       config.minimumFrameInterval = CMTimeMake(1, (int32_t)MAX(1, fps));
       config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+      // LOCAL PATCH (ringopus): honor the `cursor: 'never'` getDisplayMedia
+      // constraint (parsed in FlutterRTCDesktopCapturer.m) instead of the
+      // stock hardcoded YES, mirroring the Windows-side patch in
+      // common/cpp/src/flutter_screen_capture.cc. showsCursor requires
+      // macOS 13.0; on 12.3-12.x the cursor stays in the capture.
       if (@available(macOS 13.0, *)) {
-        config.showsCursor = YES;
+        config.showsCursor = showCursor;
+      } else if (!showCursor) {
+        NSLog(@"ScreenCaptureKit: cursor exclusion requested but requires macOS 13+");
       }
 
       self.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:nil];

@@ -9,6 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)startCaptureWithFPS:(NSInteger)fps
                    sourceId:(NSString* _Nullable)sourceId
+                 showCursor:(BOOL)showCursor
                   onStarted:(void (^ _Nonnull)(NSError * _Nullable error))onStarted;
 
 - (void)stopCaptureWithCompletion:(void (^ _Nonnull)(void))completion;

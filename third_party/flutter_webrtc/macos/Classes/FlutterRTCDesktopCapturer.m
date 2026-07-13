@@ -93,6 +93,12 @@ NSArray<RTCDesktopSource*>* _captureSources;
   NSString* sourceId = nil;
   BOOL useDefaultScreen = NO;
   NSInteger fps = 30;
+  // LOCAL PATCH (ringopus): honor a `video: { cursor: 'never' }` constraint so
+  // the sharer's cursor can be excluded from the captured frame, mirroring the
+  // Windows-side patch in common/cpp/src/flutter_screen_capture.cc. Only
+  // effective on the ScreenCaptureKit (screen) path on macOS 13+; window
+  // capture and the pre-12.3 fallback keep the cursor. See DECISIONS.md.
+  BOOL showCursor = YES;
   id videoConstraints = constraints[@"video"];
   if ([videoConstraints isKindOfClass:[NSNumber class]] && [videoConstraints boolValue] == YES) {
     useDefaultScreen = YES;
@@ -116,6 +122,10 @@ NSArray<RTCDesktopSource*>* _captureSources;
       if (frameRate != nil && [frameRate isKindOfClass:[NSNumber class]]) {
         fps = [frameRate integerValue];
       }
+    }
+    id cursor = videoConstraints[@"cursor"];
+    if ([cursor isKindOfClass:[NSString class]] && [cursor isEqualToString:@"never"]) {
+      showCursor = NO;
     }
   }
   RTCDesktopCapturer* desktopCapturer;
@@ -145,6 +155,7 @@ NSArray<RTCDesktopSource*>* _captureSources;
           [[FlutterScreenCaptureKitCapturer alloc] initWithDelegate:videoProcessingAdapter];
       [screenCaptureKitCapturer startCaptureWithFPS:fps
                                            sourceId:sourceId
+                                         showCursor:showCursor
                                           onStarted:^(NSError * _Nullable error) {
                                             if (error != nil) {
                                               NSLog(@"ScreenCaptureKit start failed: %@", error);
