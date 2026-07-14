@@ -26,6 +26,16 @@ class ProducerHomePage extends StatefulWidget {
 
 enum _Phase { disconnected, connecting, connected, sessionIncoming, ready, sharing, error }
 
+/// One chat line. `fromMe` distinguishes local echo of our own sends from
+/// incoming agent messages; `from` is the agent's display name (unused when
+/// `fromMe` is true — rendered as "You" instead).
+class _ChatEntry {
+  _ChatEntry({required this.fromMe, required this.from, required this.body});
+  final bool fromMe;
+  final String from;
+  final String body;
+}
+
 // Why a drop is being torn down - purely for status text / notifyPeer choice,
 // not a new _Phase value (see DECISIONS.md-style reasoning in the plan this
 // implements: reuses _Phase.error, orthogonal boolean flags for "still
@@ -82,6 +92,18 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   String? _transientBanner;
   Timer? _transientBannerTimer;
 
+  // Chat (Phase 2). Purely additive to the JSON-over-message channel — no
+  // whixp/XMPP protocol changes, same as every other message type here.
+  // _chatAvailable reflects the server's chatAvailable flag on transport-
+  // params (the customer never learns the actual room JID — see
+  // DECISIONS.md's Phase 1 design), so "no chat this session" is a normal,
+  // expected, always-possible state, not an error to special-case.
+  bool _chatAvailable = false;
+  bool _chatOpen = false;
+  final List<_ChatEntry> _chatMessages = [];
+  final _chatController = TextEditingController();
+  final ScrollController _chatScrollController = ScrollController();
+
   // Network-drop detection/recovery state (orthogonal to _Phase, same
   // convention as _agentOnHold above). _tearingDown guards _teardownSession
   // against double invocation - XMPP's unrecoverable timer and mediasoup's
@@ -122,6 +144,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _xmpp?.disconnect();
     _renderer.dispose();
     _logScrollController.dispose();
+    _chatController.dispose();
+    _chatScrollController.dispose();
     _transientBannerTimer?.cancel();
     _consentTimer?.cancel();
     super.dispose();
@@ -273,7 +297,46 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         await _signaling.createSendTransport(send);
         await _signaling.createRecvTransport(recv);
         _appendLog('[mediasoup] send + recv transports created from real transport-params');
+        if (mounted) {
+          setState(() {
+            _chatAvailable = (msg['chatAvailable'] as bool?) ?? false;
+            _chatMessages.clear();
+            _chatOpen = false;
+          });
+        }
         _setPhase(_Phase.ready, 'Ready to share your screen');
+
+      case 'chat-message':
+        final from = (msg['from'] as String?) ?? 'Agent';
+        final body = (msg['body'] as String?) ?? '';
+        if (mounted) {
+          setState(() => _chatMessages.add(_ChatEntry(fromMe: false, from: from, body: body)));
+        }
+        _scrollChatToBottom();
+
+      case 'chat-history':
+        final entries = ((msg['messages'] as List<dynamic>?) ?? const [])
+            .map((m) {
+              final map = m as Map<String, dynamic>;
+              final isMe = map['from'] == 'customer';
+              return _ChatEntry(
+                fromMe: isMe,
+                from: isMe ? 'You' : ((map['from'] as String?) ?? 'Agent'),
+                body: (map['body'] as String?) ?? '',
+              );
+            })
+            .toList();
+        if (mounted) {
+          setState(() {
+            _chatMessages
+              ..clear()
+              ..addAll(entries);
+          });
+        }
+        _scrollChatToBottom();
+
+      case 'chat-message-error':
+        _appendLog('[chat] send failed: ${msg['reason']}');
 
       case 'connect-transport-ack':
         _signaling.resolveConnect(msg['transportId'] as String);
@@ -364,6 +427,25 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     if (!_guestMode || _xmpp == null || !_xmppConnected) return;
     if (mounted) setState(() => _guestCode = '');
     _xmpp!.sendToComponent({'type': 'guest-code-request'});
+  }
+
+  void _sendChatMessage() {
+    final text = _chatController.text.trim();
+    if (text.isEmpty || _xmpp == null || _signaling.sid.isEmpty) return;
+    _xmpp!.sendToComponent({'type': 'chat-message', 'sid': _signaling.sid, 'body': text});
+    if (mounted) {
+      setState(() => _chatMessages.add(_ChatEntry(fromMe: true, from: 'You', body: text)));
+    }
+    _chatController.clear();
+    _scrollChatToBottom();
+  }
+
+  void _scrollChatToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_chatScrollController.hasClients) {
+        _chatScrollController.jumpTo(_chatScrollController.position.maxScrollExtent);
+      }
+    });
   }
 
   Future<void> _startCapture() async {
@@ -552,6 +634,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _consentTimer?.cancel();
     _consentPending = false;
     _pendingSessionFrom = '';
+    _chatAvailable = false;
+    _chatOpen = false;
+    _chatMessages.clear();
     _cancelAllDropTimers();
     if (mounted) {
       final backToIdle =
@@ -574,6 +659,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _xmppUnrecoverableTimer = null;
         if (_xmppReconnecting && mounted) {
           setState(() => _xmppReconnecting = false);
+          // Request an authoritative chat resync. XEP-0198 SM resume would
+          // have redelivered any queued chat-message stanzas transparently
+          // anyway, but this covers the case where the drop actually forced
+          // a fresh bind instead of a resume.
+          if (_chatAvailable && _signaling.sid.isNotEmpty) {
+            _xmpp?.sendToComponent({'type': 'chat-history-request', 'sid': _signaling.sid});
+          }
         }
         // XMPP is the transport for restart-ice signaling. Any mediasoup
         // recovery that was waiting for XMPP to come back can now fire
@@ -906,8 +998,118 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     return Column(
       children: [
         _buildControlRow(),
-        Expanded(child: _buildPreviewArea()),
+        Expanded(
+          child: Row(
+            children: [
+              Expanded(child: _buildPreviewArea()),
+              if (_chatOpen && _chatAvailable) _buildChatPanel(),
+            ],
+          ),
+        ),
       ],
+    );
+  }
+
+  Widget _buildChatPanel() {
+    return Container(
+      width: 300,
+      margin: const EdgeInsets.fromLTRB(0, 16, 16, 16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCornerRadius + 4),
+        border: Border.all(color: AppColors.hairline),
+      ),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 10, 6, 10),
+            child: Row(
+              children: [
+                Text('Chat', style: Theme.of(context).textTheme.titleSmall),
+                const Spacer(),
+                IconButton(
+                  tooltip: 'Close',
+                  icon: const Icon(Icons.close, size: 18),
+                  onPressed: () => setState(() => _chatOpen = false),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1, color: AppColors.hairline),
+          Expanded(
+            child: _chatMessages.isEmpty
+                ? Center(
+                    child: Text(
+                      'No messages yet',
+                      style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                    ),
+                  )
+                : ListView.builder(
+                    controller: _chatScrollController,
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _chatMessages.length,
+                    itemBuilder: (context, i) => _buildChatBubble(_chatMessages[i]),
+                  ),
+          ),
+          const Divider(height: 1, color: AppColors.hairline),
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _chatController,
+                    style: const TextStyle(fontSize: 13),
+                    decoration: const InputDecoration(
+                      hintText: 'Message…',
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                    ),
+                    onSubmitted: (_) => _sendChatMessage(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  tooltip: 'Send',
+                  icon: const Icon(Icons.send, size: 18),
+                  onPressed: _sendChatMessage,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatBubble(_ChatEntry entry) {
+    return Align(
+      alignment: entry.fromMe ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        constraints: const BoxConstraints(maxWidth: 220),
+        decoration: BoxDecoration(
+          color: entry.fromMe ? AppColors.accent.withValues(alpha: 0.22) : AppColors.background,
+          borderRadius: BorderRadius.circular(kCornerRadius),
+          border: Border.all(color: AppColors.hairline),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (!entry.fromMe)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Text(
+                  entry.from,
+                  style: TextStyle(color: AppColors.textSecondary, fontSize: 10, fontWeight: FontWeight.w600),
+                ),
+              ),
+            Text(entry.body, style: const TextStyle(color: AppColors.textPrimary, fontSize: 13)),
+          ],
+        ),
+      ),
     );
   }
 
@@ -923,6 +1125,15 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
               overflow: TextOverflow.ellipsis,
             ),
           ),
+          if ((_phase == _Phase.ready || _phase == _Phase.sharing) && _chatAvailable)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: OutlinedButton.icon(
+                onPressed: () => setState(() => _chatOpen = !_chatOpen),
+                icon: const Icon(Icons.chat_bubble_outline, size: 18),
+                label: Text(_chatOpen ? 'Hide Chat' : 'Chat'),
+              ),
+            ),
           if (_phase == _Phase.ready)
             FilledButton.icon(
               onPressed: _startCapture,
