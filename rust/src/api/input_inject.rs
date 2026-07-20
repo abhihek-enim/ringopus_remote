@@ -125,6 +125,7 @@ struct InputEvent {
     y: Option<f64>,
     button: Option<String>,
     key: Option<String>,
+    on: Option<bool>,
     #[serde(rename = "deltaX")]
     #[allow(dead_code)] // not read yet - horizontal scroll isn't wired in the original either
     delta_x: Option<f64>,
@@ -145,6 +146,45 @@ fn last_error() -> &'static Mutex<Option<String>> {
 fn record_error(msg: String) {
     eprintln!("[input_inject] {msg}");
     *last_error().lock().unwrap() = Some(msg);
+}
+
+/// Last CapsLock state actually applied to this OS by this process. Compared
+/// against each incoming "capslock" message so a duplicate/replayed message
+/// (the data channel is unordered with zero retransmits, same reliability
+/// concern the mousemove seq staleness check elsewhere in this pipeline
+/// handles) can never re-toggle an already-correct state.
+fn caps_lock_state() -> &'static Mutex<bool> {
+    static CAPS_LOCK_STATE: OnceLock<Mutex<bool>> = OnceLock::new();
+    CAPS_LOCK_STATE.get_or_init(|| Mutex::new(false))
+}
+
+/// Runs a fallible Enigo-mutating operation, hopping onto the main thread
+/// first on macOS (TSM/TIS's hard main-thread requirement - see the
+/// main_thread module docs above). A plain direct call everywhere else.
+fn run_keyboard_op(
+    enigo: &mut Enigo,
+    op: impl FnOnce(&mut Enigo) -> enigo::InputResult<()> + Send,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut err: Option<String> = None;
+        {
+            let err_ref = &mut err;
+            main_thread::run_sync(move || {
+                if let Err(e) = op(enigo) {
+                    *err_ref = Some(e.to_string());
+                }
+            });
+        }
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        op(enigo).map_err(|e| e.to_string())
+    }
 }
 
 fn injector_sender() -> &'static Sender<InputEvent> {
@@ -240,26 +280,47 @@ fn handle_event(enigo: &mut Enigo, payload: InputEvent) -> Result<(), String> {
                 Release
             };
             if let Some(k) = payload.key.as_deref().and_then(map_key) {
-                // macOS: must run on the main queue - see the main_thread
-                // module docs. Everywhere else the direct call is fine.
-                #[cfg(target_os = "macos")]
-                {
-                    let mut err: Option<String> = None;
-                    {
-                        let enigo_ref = &mut *enigo;
-                        let err_ref = &mut err;
-                        main_thread::run_sync(move || {
-                            if let Err(e) = enigo_ref.key(k, dir) {
-                                *err_ref = Some(e.to_string());
-                            }
-                        });
+                match k {
+                    // Printable characters are injected as literal Unicode
+                    // text rather than a held key press/release. This
+                    // sidesteps a bug in enigo 0.6.1's Windows backend:
+                    // Key::Unicode's press/release path resolves the
+                    // character via VkKeyScanExW, whose return value packs
+                    // the layout's required shift-state into the high byte -
+                    // the crate casts the raw i16 straight into VIRTUAL_KEY
+                    // without masking it off, so any character needing Shift
+                    // on the layout (every uppercase letter, `!@#$%^&*()_+`
+                    // etc.) produces an out-of-range virtual-key and silently
+                    // fails to inject. text() (KEYEVENTF_UNICODE on Windows)
+                    // bypasses VK/shift-state resolution entirely on both
+                    // platforms. Only fired on the down edge - text() already
+                    // presses+releases in one call, and synthetic
+                    // remote-control input has no real "hold to repeat"
+                    // concept the way a physically held key does.
+                    Key::Unicode(c) if dir == Press => {
+                        run_keyboard_op(enigo, move |e| e.text(&c.to_string()))?;
                     }
-                    if let Some(e) = err {
-                        return Err(e);
-                    }
+                    Key::Unicode(_) => {} // release half of the pair above - no-op
+                    _ => run_keyboard_op(enigo, move |e| e.key(k, dir))?,
                 }
-                #[cfg(not(target_os = "macos"))]
-                enigo.key(k, dir).map_err(|e| e.to_string())?;
+            }
+        }
+        "capslock" => {
+            // CapsLock is a toggle, not a hold key, and browsers do not agree
+            // on keydown/keyup cardinality per press across platforms - the
+            // sender (agent app) already reduces this to a single
+            // edge-triggered "the resulting state is now X" boolean via
+            // getModifierState, so this only needs to reach that boolean
+            // exactly once, guarded against duplicate/out-of-order delivery
+            // on the unordered/no-retransmit data channel.
+            let desired = payload.on.unwrap_or(false);
+            let mut state = caps_lock_state().lock().unwrap();
+            if *state != desired {
+                run_keyboard_op(enigo, |e| {
+                    e.key(Key::CapsLock, Press)?;
+                    e.key(Key::CapsLock, Release)
+                })?;
+                *state = desired;
             }
         }
         _ => {}
@@ -299,7 +360,9 @@ fn map_key(key: &str) -> Option<Key> {
         "Shift" => Some(Key::Shift),
         "Alt" => Some(Key::Alt),
         "Meta" | "OS" => Some(Key::Meta),
-        "CapsLock" => Some(Key::CapsLock),
+        // CapsLock is handled via the dedicated "capslock" message (see
+        // handle_event) rather than the generic keydown/keyup path - it's
+        // architecturally a toggle, not a hold key, see there for why.
         k if k.chars().count() == 1 => Some(Key::Unicode(k.chars().next().unwrap())),
         _ => None,
     }
