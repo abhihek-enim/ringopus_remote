@@ -1,7 +1,13 @@
 // Real router.rtpCapabilities captured from a live 'get-router-caps' call
-// against the actual orchestrator (2026-07-02). Kept identical to
-// phase2_bridge/config.mjs's copy so both sides negotiate against the same
-// values.
+// against the actual orchestrator (2026-07-02). Reference/parity only — the
+// client negotiates against the LIVE caps from the 'router-rtp-capabilities'
+// message, not this snapshot.
+//
+// STALE re: codecs (2026-07-17): the router config now also advertises
+// video/AV1 and video/VP9 (server/config.js codec preference chain
+// AV1>H264>VP9>VP8). This captured snapshot predates them and still lists only
+// VP8+H264; re-capture from a live get-router-caps if an exact snapshot is
+// needed. Functionally harmless since this file isn't used for negotiation.
 final Map<String, dynamic> routerRtpCapabilitiesJson = {
   'codecs': [
     {

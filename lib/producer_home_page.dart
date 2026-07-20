@@ -9,7 +9,6 @@ import 'app_log.dart';
 import 'mediasoup/mediasoup_client.dart';
 import 'mediasoup_signaling.dart';
 import 'router_rtp_capabilities.dart';
-import 'screen_source_picker.dart';
 import 'src/rust/api/input_inject.dart';
 import 'theme.dart';
 import 'xmpp/xmpp_client.dart';
@@ -100,6 +99,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   // expected, always-possible state, not an error to special-case.
   bool _chatAvailable = false;
   bool _chatOpen = false;
+  // Codec the server tells this customer to produce (AV1|H264|VP9|VP8), from
+  // the callee transport-params. H264 until a session sets it (safe default).
+  String _produceCodec = 'H264';
   final List<_ChatEntry> _chatMessages = [];
   final _chatController = TextEditingController();
   final ScrollController _chatScrollController = ScrollController();
@@ -294,6 +296,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'transport-params':
         final send = msg['send'] as Map<String, dynamic>;
         final recv = msg['recv'] as Map<String, dynamic>;
+        // The server walks the codec preference chain (AV1>H264>VP9>VP8)
+        // against both sides' caps and names the one this customer must
+        // produce; default H264 if an older server omits it.
+        _produceCodec = (msg['produceCodec'] as String?) ?? 'H264';
+        _appendLog('[mediasoup] server-selected produce codec: $_produceCodec');
         await _signaling.createSendTransport(send);
         await _signaling.createRecvTransport(recv);
         _appendLog('[mediasoup] send + recv transports created from real transport-params');
@@ -395,7 +402,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _xmpp!.sendToComponent({
       'type': 'session-accept',
       'sid': _signaling.sid,
-      'rtpCapabilities': routerRtpCapabilitiesJson,
+      // Advertise the device's REAL negotiated capabilities (native ∩ router),
+      // not the stale hardcoded snapshot — otherwise the server's codec walk
+      // only ever sees VP8/H264 and can never select AV1/VP9 even when both
+      // sides support them. Falls back to the snapshot only if the device
+      // somehow isn't loaded (it always is by accept time).
+      'rtpCapabilities':
+          _signaling.device?.rtpCapabilities.toMap() ?? routerRtpCapabilitiesJson,
     });
     _setPhase(_Phase.sessionIncoming, 'Session accepted — setting up transports…');
   }
@@ -449,11 +462,18 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   }
 
   Future<void> _startCapture() async {
-    final source = await showDialog<DesktopCapturerSource>(
-      context: context,
-      builder: (_) => const ScreenSourcePicker(),
-    );
-    if (source == null) return;
+    final List<DesktopCapturerSource> sources;
+    try {
+      sources = await desktopCapturer.getSources(types: [SourceType.Screen]);
+    } catch (e) {
+      _appendLog('Capture failed: could not enumerate screens: $e');
+      return;
+    }
+    if (sources.isEmpty) {
+      _appendLog('Capture failed: no screen source available');
+      return;
+    }
+    final source = sources.first;
 
     try {
       final stream = await navigator.mediaDevices.getDisplayMedia({
@@ -491,11 +511,22 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     final stream = _stream;
     if (device == null || stream == null) return;
 
-    final h264 = device.rtpCapabilities.codecs
-        .where((c) => c.mimeType.toLowerCase() == 'video/h264')
+    // Produce the codec the server selected from the preference chain
+    // (AV1>H264>VP9>VP8, matched against our own send caps + the agent's recv
+    // caps). Fall back to H264 if — impossibly — the named codec isn't in our
+    // device caps, so we never fail to produce.
+    final wantMime = 'video/${_produceCodec.toLowerCase()}';
+    var codec = device.rtpCapabilities.codecs
+        .where((c) => c.mimeType.toLowerCase() == wantMime)
         .firstOrNull;
-    if (h264 == null) {
-      _appendLog('ERROR: no H.264 in device.rtpCapabilities — cannot force codec');
+    if (codec == null) {
+      _appendLog('WARNING: server-selected $_produceCodec not in device caps — falling back to H264');
+      codec = device.rtpCapabilities.codecs
+          .where((c) => c.mimeType.toLowerCase() == 'video/h264')
+          .firstOrNull;
+    }
+    if (codec == null) {
+      _appendLog('ERROR: no usable video codec in device.rtpCapabilities — cannot produce');
       return;
     }
 
@@ -526,7 +557,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     await _signaling.produce(
       track: stream.getVideoTracks().first,
       stream: stream,
-      codec: h264,
+      codec: codec,
       scaleResolutionDownBy: scaleDown,
       onProducer: (producer) {
         _appendLog('--- Producer created: ${producer.id} ---');
@@ -536,19 +567,23 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   }
 
   void _logCodecParity(RtpParameters rtpParameters) {
-    final h264 = rtpParameters.codecs.where((c) => c.mimeType.toLowerCase() == 'video/h264');
-    if (h264.isEmpty) {
-      _appendLog('CODEC PARITY: no H.264 entry in negotiated rtpParameters');
+    // Codec-agnostic now that produce can be AV1/H264/VP9/VP8 — log whatever
+    // primary video codec was actually negotiated (ignore rtx). For H264 the
+    // profile-level-id still matters, so surface it when present.
+    final videoCodecs = rtpParameters.codecs.where((c) {
+      final m = c.mimeType.toLowerCase();
+      return m.startsWith('video/') && m != 'video/rtx';
+    });
+    if (videoCodecs.isEmpty) {
+      _appendLog('CODEC: no video codec in negotiated rtpParameters');
       return;
     }
-    final codec = h264.first;
+    final codec = videoCodecs.first;
+    final profile = codec.parameters['profile-level-id'];
     _appendLog(
-      'CODEC PARITY: profile-level-id=${codec.parameters['profile-level-id']} '
-      '(baseline $baselineProfileLevelId) '
-      'packetization-mode=${codec.parameters['packetization-mode']} '
-      '(baseline $baselinePacketizationMode) '
-      'level-asymmetry-allowed=${codec.parameters['level-asymmetry-allowed']} '
-      '(baseline $baselineLevelAsymmetryAllowed)',
+      'CODEC: negotiated ${codec.mimeType}'
+      '${profile != null ? ' profile-level-id=$profile (baseline $baselineProfileLevelId)' : ''}'
+      ' params=${codec.parameters}',
     );
   }
 
