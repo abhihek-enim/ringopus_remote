@@ -4,10 +4,38 @@ import 'dart:convert';
 import 'package:collection/collection.dart';
 
 import 'mediasoup/mediasoup_client.dart';
+// The fork's ICE types live in handler_interface.dart, which the barrel
+// (mediasoup_client.dart) does not re-export. Shown explicitly so the
+// signaling layer can build RTCIceServer entries for TURN. No clash with
+// flutter_webrtc (it has no RTCIceServer class).
+import 'mediasoup/src/handlers/handler_interface.dart'
+    show RTCIceServer, RTCIceTransportPolicy, RTCIceCredentialType;
 import 'src/rust/api/input_inject.dart';
 
 const Duration produceTimeout = Duration(seconds: 10);
 const Duration connectTimeout = Duration(seconds: 10);
+
+// Debug-only: force ICE to use ONLY relay candidates, to prove the TURN path
+// in isolation. Build with `flutter run -d windows --dart-define=FORCE_TURN_RELAY=true`;
+// false in every normal build. Compile-time const, so zero runtime cost when off.
+const bool _kForceTurnRelay = bool.fromEnvironment('FORCE_TURN_RELAY');
+
+/// Converts the server's JSON `iceServers` (from transport-params) into the
+/// vendored fork's [RTCIceServer]. The fork's type REQUIRES `username` and
+/// `credentialType` (unlike the DOM shape), so both are always set. Null/absent
+/// ⇒ empty list ⇒ direct-only, exactly as before TURN existed.
+List<RTCIceServer> _parseIceServers(List<dynamic>? raw) {
+  if (raw == null) return const <RTCIceServer>[];
+  return raw.map((s) {
+    final m = s as Map<String, dynamic>;
+    return RTCIceServer(
+      urls: List<String>.from(m['urls'] as List),
+      username: (m['username'] as String?) ?? '',
+      credential: m['credential'],
+      credentialType: RTCIceCredentialType.password,
+    );
+  }).toList();
+}
 
 class _ConnectPending {
   _ConnectPending(this.callback, this.errback, this.timer);
@@ -79,7 +107,10 @@ class MediasoupSignaling {
     );
   }
 
-  Future<void> createSendTransport(Map<String, dynamic> params) async {
+  Future<void> createSendTransport(
+    Map<String, dynamic> params, {
+    List<dynamic>? iceServers,
+  }) async {
     final device = _device;
     if (device == null) {
       throw StateError('[MediasoupSignaling] device not loaded');
@@ -95,6 +126,9 @@ class MediasoupSignaling {
       sctpParameters: params['sctpParameters'] != null
           ? SctpParameters.fromMap(params['sctpParameters'])
           : null,
+      // TURN relay (server-issued; empty list = direct-only, as before).
+      iceServers: _parseIceServers(iceServers),
+      iceTransportPolicy: _kForceTurnRelay ? RTCIceTransportPolicy.relay : null,
     );
     _sendTransport = transport;
     // ignore: avoid_print
@@ -151,7 +185,10 @@ class MediasoupSignaling {
     });
   }
 
-  Future<void> createRecvTransport(Map<String, dynamic> params) async {
+  Future<void> createRecvTransport(
+    Map<String, dynamic> params, {
+    List<dynamic>? iceServers,
+  }) async {
     final device = _device;
     if (device == null) {
       throw StateError('[MediasoupSignaling] device not loaded');
@@ -167,6 +204,9 @@ class MediasoupSignaling {
       sctpParameters: params['sctpParameters'] != null
           ? SctpParameters.fromMap(params['sctpParameters'])
           : null,
+      // TURN relay (server-issued; empty list = direct-only, as before).
+      iceServers: _parseIceServers(iceServers),
+      iceTransportPolicy: _kForceTurnRelay ? RTCIceTransportPolicy.relay : null,
     );
     _recvTransport = transport;
     // ignore: avoid_print
@@ -335,6 +375,31 @@ class MediasoupSignaling {
         }
         _prevSenderBytesSent = bytesSent;
         _prevSenderStatsTimestampMs = tsMs;
+        // Relay evidence (field-debugging value; the server iceSelectedTuple is
+        // the authoritative gate): the selected candidate-pair's local
+        // candidate has candidateType 'relay' when TURN carries the session.
+        // RISK: sender-scoped getStats() may omit candidate-pair/local-candidate
+        // on Windows flutter_webrtc — then path shows '?' (fall back to
+        // PC-level stats if it matters).
+        final pair = reports.firstWhereOrNull(
+          (r) =>
+              r.type == 'candidate-pair' &&
+              (r.values['nominated'] == true || r.values['selected'] == true) &&
+              r.values['state'] == 'succeeded',
+        );
+        String path = '?';
+        if (pair != null) {
+          final localId = pair.values['localCandidateId'];
+          final local = reports.firstWhereOrNull(
+            (r) => r.type == 'local-candidate' && r.id == localId,
+          );
+          final ct = local?.values['candidateType'];
+          if (ct == 'relay') {
+            path = 'relay/${local?.values['relayProtocol'] ?? '?'}';
+          } else if (ct != null) {
+            path = ct.toString();
+          }
+        }
         // ignore: avoid_print
         print(
           '[SenderStats] qLimit=${v['qualityLimitationReason']} '
@@ -342,7 +407,8 @@ class MediasoupSignaling {
           'target=${v['targetBitrate']}bps actual=${actualBitrateKbps}kbps '
           'res=${v['frameWidth']}x${v['frameHeight']} '
           'framesEncoded=${v['framesEncoded']} '
-          'encoder=${v['encoderImplementation']}',
+          'encoder=${v['encoderImplementation']} '
+          'path=$path',
         );
       } catch (e) {
         // ignore: avoid_print

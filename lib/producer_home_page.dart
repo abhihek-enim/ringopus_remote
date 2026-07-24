@@ -301,8 +301,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         // produce; default H264 if an older server omits it.
         _produceCodec = (msg['produceCodec'] as String?) ?? 'H264';
         _appendLog('[mediasoup] server-selected produce codec: $_produceCodec');
-        await _signaling.createSendTransport(send);
-        await _signaling.createRecvTransport(recv);
+        // Server-issued TURN creds (absent = direct-only, unchanged behavior).
+        final iceServers = msg['iceServers'] as List<dynamic>?;
+        await _signaling.createSendTransport(send, iceServers: iceServers);
+        await _signaling.createRecvTransport(recv, iceServers: iceServers);
         _appendLog('[mediasoup] send + recv transports created from real transport-params');
         if (mounted) {
           setState(() {
