@@ -366,11 +366,24 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'session-held':
         _appendLog('--- session held (sid=${msg['sid']}) ---');
         _signaling.pauseSending();
+        // Defence-in-depth: disarm input injection while held so a backgrounded
+        // agent tab can never inject into this customer, independent of the
+        // server pausing our input dataConsumer at the SFU. Re-armed on resume.
+        try {
+          await stopInputInjection();
+        } catch (e) {
+          _appendLog('stopInputInjection (hold) failed: $e');
+        }
         _setHold(true, 'On hold — agent stepped away');
 
       case 'session-resumed':
         _appendLog('--- session resumed (sid=${msg['sid']}) ---');
         _signaling.resumeSending();
+        try {
+          await startInputInjection();
+        } catch (e) {
+          _appendLog('startInputInjection (resume) failed: $e');
+        }
         _setHold(false, 'Sharing "$_sourceName"');
 
       case 'session-agent-changed':
