@@ -9,6 +9,7 @@ import 'app_log.dart';
 import 'mediasoup/mediasoup_client.dart';
 import 'mediasoup_signaling.dart';
 import 'router_rtp_capabilities.dart';
+import 'src/rust/api/device_id.dart';
 import 'src/rust/api/input_inject.dart';
 import 'theme.dart';
 import 'xmpp/xmpp_client.dart';
@@ -122,16 +123,39 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   final Set<String> _mediasoupNeedingRecovery = {}; // labels ('send'/'recv') currently dropped and being recovered
   Timer? _mediasoupReconnectDeadline; // single overall give-up timer for the whole reconnect episode
 
+  // Customer Identity v2 (see ~/.claude/plans/prompt-plan-multi-session-
+  // support-distributed-nova.md, Part A) — a self-reported, MAC-derived
+  // device id, read once at startup and reused for every session-accept
+  // this run (Part B). Null until _loadDeviceId() resolves; a session
+  // started before it resolves simply omits deviceId (best-effort, not
+  // blocking on it — this is not a security mechanism).
+  String? _deviceId;
+  String? _adapterKind;
+
   @override
   void initState() {
     super.initState();
     _renderer.initialize();
     _signaling.onTransportStateChanged = _onMediasoupStateChanged;
+    _loadDeviceId();
     // Guest flow is the default: connect anonymously on launch so the
     // customer sees their pairing code without any sign-in step.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _phase == _Phase.disconnected) _connectGuest();
     });
+  }
+
+  Future<void> _loadDeviceId() async {
+    try {
+      final info = await getDeviceId();
+      _deviceId = info.deviceId;
+      _adapterKind = info.adapterKind;
+      _appendLog('[identity] deviceId ready (adapterKind=${info.adapterKind})');
+    } catch (e) {
+      // Best-effort by design (see plan Part A) — no deviceId this run is a
+      // normal degraded state, not an error condition to surface to the user.
+      _appendLog('[identity] could not determine deviceId: $e');
+    }
   }
 
   @override
@@ -450,6 +474,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       // somehow isn't loaded (it always is by accept time).
       'rtpCapabilities':
           _signaling.device?.rtpCapabilities.toMap() ?? routerRtpCapabilitiesJson,
+      // Customer Identity v2, Part B — rides on this existing message
+      // rather than a separate post-connect one (see the plan). Omitted
+      // entirely (not sent as null) if _loadDeviceId() hasn't resolved yet;
+      // the server treats a missing deviceId as "no identity this session",
+      // same as today.
+      if (_deviceId != null) 'deviceId': _deviceId,
+      if (_adapterKind != null) 'adapterKind': _adapterKind,
     });
     _setPhase(_Phase.sessionIncoming, 'Session accepted — setting up transports…');
   }

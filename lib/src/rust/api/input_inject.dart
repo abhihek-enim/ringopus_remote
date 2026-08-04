@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `handle_event`, `injector_loop`, `injector_sender`, `last_error`, `map_key`, `record_error`
+// These functions are ignored because they are not marked as `pub`: `caps_lock_state`, `handle_event`, `injector_loop`, `injector_sender`, `last_error`, `map_key`, `record_error`, `run_keyboard_op`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `InputEvent`
 
 /// Arms the input injector for a new session. Idempotent.
