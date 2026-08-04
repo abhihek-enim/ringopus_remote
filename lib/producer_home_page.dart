@@ -386,6 +386,32 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         }
         _setHold(false, 'Sharing "$_sourceName"');
 
+      // Agent-side tab-backgrounding (multi-session) — deliberately NOT
+      // session-held/session-resumed. Unlike genuine hold above, this must
+      // NEVER touch _signaling.pauseSending()/resumeSending(): the agent
+      // merely looking at a different tab must not stop this customer's
+      // screen from flowing (future recording needs it live, and a customer
+      // must never be put on hold just because the agent looked away). Only
+      // input authority changes — disarm/re-arm injection as defense-in-depth
+      // (the server's own dataProducer pause at the SFU is the authoritative
+      // barrier). No banner: this is fully invisible to the customer, unlike
+      // genuine hold's "On hold" banner above.
+      case 'agent-attention-paused':
+        _appendLog('--- agent attention paused (sid=${msg['sid']}) ---');
+        try {
+          await stopInputInjection();
+        } catch (e) {
+          _appendLog('stopInputInjection (attention-paused) failed: $e');
+        }
+
+      case 'agent-attention-resumed':
+        _appendLog('--- agent attention resumed (sid=${msg['sid']}) ---');
+        try {
+          await startInputInjection();
+        } catch (e) {
+          _appendLog('startInputInjection (attention-resumed) failed: $e');
+        }
+
       case 'session-agent-changed':
         _appendLog('--- new agent attached (sid=${msg['sid']}) ---');
         _showTransientBanner('Agent connected');
