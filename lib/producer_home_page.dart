@@ -337,7 +337,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             _chatOpen = false;
           });
         }
-        _setPhase(_Phase.ready, 'Ready to share your screen');
+        _setPhase(_Phase.ready, 'Starting screen share…');
+        // Consent was already given at Allow — no separate manual step to
+        // start sharing. _startCapture() picks the first screen source
+        // itself (no interactive picker), so this is safe to fire immediately.
+        unawaited(_startCapture());
 
       case 'chat-message':
         final from = (msg['from'] as String?) ?? 'Agent';
@@ -1241,12 +1245,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                 label: Text(_chatOpen ? 'Hide Chat' : 'Chat'),
               ),
             ),
-          if (_phase == _Phase.ready)
-            FilledButton.icon(
-              onPressed: _startCapture,
-              icon: const Icon(Icons.screen_share_outlined, size: 18),
-              label: const Text('Share Screen'),
-            ),
           if (_phase == _Phase.sharing)
             OutlinedButton.icon(
               onPressed: _stopSharing,
@@ -1267,7 +1265,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _Phase.connecting => 'Connecting…',
     _Phase.connected => 'Waiting for an incoming session request…',
     _Phase.sessionIncoming => 'Setting up transports…',
-    _Phase.ready => 'Ready — click Share Screen above',
+    _Phase.ready => 'Starting screen share…',
     _Phase.sharing => '',
     _Phase.error => _statusText,
   };
