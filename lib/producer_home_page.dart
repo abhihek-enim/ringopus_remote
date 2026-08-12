@@ -100,6 +100,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   // expected, always-possible state, not an error to special-case.
   bool _chatAvailable = false;
   bool _chatOpen = false;
+  // Messages received while _chatOpen is false; cleared on open and on any
+  // session boundary that also clears _chatMessages.
+  int _unreadChatCount = 0;
   // Codec the server tells this customer to produce (AV1|H264|VP9|VP8), from
   // the callee transport-params. H264 until a session sets it (safe default).
   String _produceCodec = 'H264';
@@ -335,6 +338,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             _chatAvailable = (msg['chatAvailable'] as bool?) ?? false;
             _chatMessages.clear();
             _chatOpen = false;
+            _unreadChatCount = 0;
           });
         }
         _setPhase(_Phase.ready, 'Starting screen share…');
@@ -347,7 +351,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         final from = (msg['from'] as String?) ?? 'Agent';
         final body = (msg['body'] as String?) ?? '';
         if (mounted) {
-          setState(() => _chatMessages.add(_ChatEntry(fromMe: false, from: from, body: body)));
+          setState(() {
+            _chatMessages.add(_ChatEntry(fromMe: false, from: from, body: body));
+            if (!_chatOpen) _unreadChatCount++;
+          });
         }
         _scrollChatToBottom();
 
@@ -748,6 +755,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _chatAvailable = false;
     _chatOpen = false;
     _chatMessages.clear();
+    _unreadChatCount = 0;
     _cancelAllDropTimers();
     if (mounted) {
       final backToIdle =
@@ -1240,8 +1248,16 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             Padding(
               padding: const EdgeInsets.only(right: 8),
               child: OutlinedButton.icon(
-                onPressed: () => setState(() => _chatOpen = !_chatOpen),
-                icon: const Icon(Icons.chat_bubble_outline, size: 18),
+                onPressed: () => setState(() {
+                  _chatOpen = !_chatOpen;
+                  if (_chatOpen) _unreadChatCount = 0;
+                }),
+                icon: _unreadChatCount > 0
+                    ? Badge(
+                        label: Text('$_unreadChatCount'),
+                        child: const Icon(Icons.chat_bubble_outline, size: 18),
+                      )
+                    : const Icon(Icons.chat_bubble_outline, size: 18),
                 label: Text(_chatOpen ? 'Hide Chat' : 'Chat'),
               ),
             ),
