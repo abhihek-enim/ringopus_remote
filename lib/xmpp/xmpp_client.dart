@@ -21,8 +21,9 @@ const String guestVhost = 'guest.ringopus';
 // drifting (.162 -> .8 -> .7) and was unreachable across Wi-Fi client
 // isolation. Relocated from eu-north-1 (Stockholm) to ap-south-1 (Mumbai)
 // to cut the India<->EU round trip out of signaling and media latency.
+// Migrated again 2026-08-12, off that EC2 instance onto a dedicated VPS.
 // Must match MS_ANNOUNCE_IP in the server's config.js.
-const String ejabberdWsHost = '3.108.60.195';
+const String ejabberdWsHost = '149.28.128.203';
 
 /// Dart port of the reference app's tempClient.ts, matched 1:1 against
 /// whixp 3.3.1's actual API (checked, not assumed). Presence
