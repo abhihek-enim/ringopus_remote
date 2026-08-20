@@ -76,3 +76,5 @@ whixp_*.db
 # session-state handoff notes) that shouldn't live in shared version control.
 CLAUDE.md
 DECISIONS.md
+decision.md
+decision_log.md
