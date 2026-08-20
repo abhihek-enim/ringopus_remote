@@ -52,5 +52,5 @@ Write-Host "==> makensis installer.nsi" -ForegroundColor Cyan
 & $makensis.Source (Join-Path $installerDir "installer.nsi")
 if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
 
-$setupExe = Join-Path $outputDir "RingopusRemoteSetup.exe"
+$setupExe = Join-Path $outputDir "OojackRemoteClientSetup.exe"
 Write-Host "==> Built: $setupExe" -ForegroundColor Green

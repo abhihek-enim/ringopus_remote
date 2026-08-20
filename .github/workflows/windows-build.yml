@@ -1,7 +1,7 @@
 name: Windows build (installer)
 
 # Builds the Flutter Windows release and packages it into a single
-# RingopusRemoteSetup.exe via the NSIS script in installer/, then publishes
+# OojackRemoteClientSetup.exe via the NSIS script in installer/, then publishes
 # it to the same rolling "latest" release used by macos-build.yml (alongside
 # the .dmg from that workflow).
 #
@@ -61,7 +61,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ringopus_remote_producer-windows-setup
-          path: installer/Output/RingopusRemoteSetup.exe
+          path: installer/Output/OojackRemoteClientSetup.exe
           retention-days: 14
 
       - name: Publish/update the "latest" release with the setup .exe
@@ -72,6 +72,6 @@ jobs:
           body: |
             Automated unsigned Windows build from commit ${{ github.sha }}.
             Installs via a standard NSIS setup wizard (or silently with
-            `RingopusRemoteSetup.exe /S`); supports upgrade-over and clean
+            `OojackRemoteClientSetup.exe /S`); supports upgrade-over and clean
             uninstall from Windows "Apps & Features".
-          files: installer/Output/RingopusRemoteSetup.exe
+          files: installer/Output/OojackRemoteClientSetup.exe

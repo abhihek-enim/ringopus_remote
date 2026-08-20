@@ -10,7 +10,7 @@
 ; or just run installer\build.ps1, which also runs `flutter build` first.
 ;
 ; Output:
-;   installer\Output\RingopusRemoteSetup.exe
+;   installer\Output\OojackRemoteClientSetup.exe
 ;
 ; Only stock NSIS includes are used (MUI2, x64, FileFunc, WordFunc, LogicLib) -
 ; all of these ship with any standard NSIS installation, so no third-party
@@ -33,7 +33,7 @@ Unicode true
 
 !define RELEASE_DIR              "..\build\windows\x64\runner\Release"
 !define ICON_FILE                "..\windows\runner\resources\app_icon.ico"
-!define OUTPUT_FILE              "Output\RingopusRemoteSetup.exe"
+!define OUTPUT_FILE              "Output\OojackRemoteClientSetup.exe"
 
 !define UNINST_KEY   "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_APP_ID}"
 !define INSTALLER_MUTEX "Global\${PRODUCT_APP_ID}_SetupMutex"
