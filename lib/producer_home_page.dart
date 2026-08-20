@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:whixp/whixp.dart' show TransportState;
+import 'package:window_manager/window_manager.dart';
 
 import 'app_log.dart';
 import 'mediasoup/mediasoup_client.dart';
@@ -65,7 +66,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   MediaStream? _stream;
   _Phase _phase = _Phase.disconnected;
   String _statusText = 'Not connected';
-  String _connectedJid = '';
   String _sourceName = '';
   bool _logExpanded = false;
   // Hidden by default for now - reveal is a follow-up keyboard shortcut
@@ -269,7 +269,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     xmpp.onConnected = (boundJid) {
       _appendLog('[xmpp] connected as $boundJid');
       _xmppConnected = true; // stream is negotiated/bound — restart-ice can now travel
-      setState(() => _connectedJid = boundJid);
       _setPhase(_Phase.connected, 'Connected — requesting router capabilities…');
       xmpp.sendToComponent({'type': 'get-router-caps'});
     };
@@ -295,7 +294,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _xmpp = null;
     if (!mounted) return;
     setState(() {
-      _connectedJid = '';
       _phase = _Phase.disconnected;
       _statusText = 'Not connected';
     });
@@ -622,6 +620,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       _renderer.srcObject = stream;
       setState(() => _sourceName = source.name);
       _setPhase(_Phase.sharing, 'Sharing “${source.name}”');
+      // Get the app out of the way the instant sharing actually starts -
+      // a support customer has no reason to keep looking at this window
+      // once the agent can see their screen, and it doubles as a second
+      // guard against this app's own window ever showing up inside the
+      // capture (the in-app preview loopback is handled separately, see
+      // _buildPreviewPlaceholder()'s _Phase.sharing branch above).
+      unawaited(windowManager.minimize());
       _tearingDown = false; // fresh session - re-arm the teardown choke point
       // Input injection is independent of video capture/produce - a Rust
       // bridge failure here (e.g. a debug-build content-hash mismatch) must
@@ -1005,10 +1010,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
               decoration: BoxDecoration(color: _statusDotColor, shape: BoxShape.circle),
             ),
             const SizedBox(width: 10),
-            Expanded(
-              child: _isConnected
-                  ? Text(_connectedJid, style: appMonoStyle(fontSize: 13), overflow: TextOverflow.ellipsis)
-                  : const Text('Oojack Remote — Producer'),
+            // Always the static branded title, never the raw connected JID -
+            // for a guest session that JID's domain is guest.ringopus, which
+            // has no reason to ever reach the customer's screen. The status
+            // dot to the left already communicates connection state.
+            const Expanded(
+              child: Text('Oojack Remote'),
             ),
           ],
         ),

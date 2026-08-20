@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'app_log.dart';
 import 'producer_home_page.dart';
@@ -15,6 +16,12 @@ void main() {
   // run`/Terminal output is unchanged.
   runZonedGuarded(
     () async {
+      // window_manager needs the binding + its own (lightweight, reliable -
+      // unlike the Rust bridge below) native init before anything can call
+      // windowManager.minimize() later. Safe to await ahead of runApp(),
+      // unlike RustLib.init() - see the comment on that below.
+      WidgetsFlutterBinding.ensureInitialized();
+      await windowManager.ensureInitialized();
       // Render the UI first, then bring up the Rust bridge. Gating runApp on
       // RustLib.init() means any init failure leaves a blank window with the
       // error buried in AppLog (which never renders) - render first so the log
@@ -45,7 +52,7 @@ class RingopusProducerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Oojack Remote Producer',
+      title: 'Oojack Remote',
       theme: buildAppTheme(),
       home: const ProducerHomePage(),
     );
