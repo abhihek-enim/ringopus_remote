@@ -131,6 +131,15 @@ struct InputEvent {
     delta_x: Option<f64>,
     #[serde(rename = "deltaY")]
     delta_y: Option<f64>,
+    // Whether Ctrl (Windows/Linux) / Cmd (macOS) is held on this keydown/
+    // keyup, as reported by the agent's KeyboardEvent.ctrlKey/metaKey. Used
+    // to decide text() vs a real key() press in handle_event() below - see
+    // the comment there. serde has no deny_unknown_fields, so before this
+    // field existed the agent's already-sent `ctrl` value was silently
+    // dropped on the floor; that was the root cause of Ctrl+C/A/Z-style
+    // chords never registering.
+    ctrl: Option<bool>,
+    meta: Option<bool>,
 }
 
 /// Most recent injection-side failure, surfaced back through inject_input()'s
@@ -279,28 +288,70 @@ fn handle_event(enigo: &mut Enigo, payload: InputEvent) -> Result<(), String> {
             } else {
                 Release
             };
+            // Ctrl (Windows/Linux) or Cmd (macOS) held on THIS event, per the
+            // agent's KeyboardEvent.ctrlKey/metaKey.
+            let modifier_held = payload.ctrl.unwrap_or(false) || payload.meta.unwrap_or(false);
             if let Some(k) = payload.key.as_deref().and_then(map_key) {
                 match k {
                     // Printable characters are injected as literal Unicode
-                    // text rather than a held key press/release. This
-                    // sidesteps a bug in enigo 0.6.1's Windows backend:
-                    // Key::Unicode's press/release path resolves the
-                    // character via VkKeyScanExW, whose return value packs
-                    // the layout's required shift-state into the high byte -
-                    // the crate casts the raw i16 straight into VIRTUAL_KEY
-                    // without masking it off, so any character needing Shift
-                    // on the layout (every uppercase letter, `!@#$%^&*()_+`
-                    // etc.) produces an out-of-range virtual-key and silently
-                    // fails to inject. text() (KEYEVENTF_UNICODE on Windows)
-                    // bypasses VK/shift-state resolution entirely on both
-                    // platforms. Only fired on the down edge - text() already
-                    // presses+releases in one call, and synthetic
-                    // remote-control input has no real "hold to repeat"
-                    // concept the way a physically held key does.
-                    Key::Unicode(c) if dir == Press => {
+                    // text rather than a held key press/release, UNLESS a
+                    // Ctrl/Cmd modifier is currently held - see the Release
+                    // arm below for why, and why routing through key() here
+                    // is still safe for the plain-typing case this sidesteps.
+                    //
+                    // The text() path exists to dodge a real bug in enigo
+                    // 0.6.1's Windows backend: Key::Unicode's press/release
+                    // path resolves the character via VkKeyScanExW, whose
+                    // return value packs the layout's required shift-state
+                    // into the high byte - the crate casts the raw i16
+                    // straight into VIRTUAL_KEY without masking it off, so
+                    // any character needing Shift on the layout (every
+                    // uppercase letter, `!@#$%^&*()_+` etc.) produces an
+                    // out-of-range virtual-key and silently fails to inject.
+                    // text() (KEYEVENTF_UNICODE on Windows) bypasses VK/
+                    // shift-state resolution entirely on both platforms -
+                    // correct and necessary for ordinary typing.
+                    //
+                    // But text() ALSO bypasses modifier resolution by
+                    // design: it inserts the literal character regardless of
+                    // whatever is currently held, so a letter typed while
+                    // Ctrl/Cmd is down never chords into "Ctrl+C"/"Cmd+C" at
+                    // the OS level - the target app just sees an unrelated
+                    // character inserted, and the shortcut silently does
+                    // nothing. When a modifier is held, route through a
+                    // real key() press instead so the OS sees an actual
+                    // keydown on that key while the modifier is held (safe
+                    // for the common Ctrl/Cmd+lowercase-letter case
+                    // specifically - VkKeyScanExW's shift-state corruption
+                    // only bites characters that need Shift on the layout,
+                    // and a bare lowercase letter with Ctrl/Cmd held isn't
+                    // one of those).
+                    Key::Unicode(c) if dir == Press && !modifier_held => {
                         run_keyboard_op(enigo, move |e| e.text(&c.to_string()))?;
                     }
-                    Key::Unicode(_) => {} // release half of the pair above - no-op
+                    Key::Unicode(_) if dir == Release => {
+                        // Always attempt a real release, regardless of
+                        // whether THIS release event reports a modifier
+                        // held. Browsers usually deliver a letter's keyup
+                        // while its modifier is still held, but if the
+                        // user releases Ctrl/Cmd before the letter, the
+                        // letter's keyup would otherwise arrive with
+                        // modifier_held == false and (under the old logic)
+                        // fall through as a no-op - leaving the press-side
+                        // key() call above (fired while the modifier WAS
+                        // held) with no matching release, stuck down at the
+                        // OS level. A synthetic release for a key that was
+                        // actually inserted via text() on press (the
+                        // ordinary no-modifier typing case) is a documented
+                        // no-op on both platforms, so doing this
+                        // unconditionally is safe for that case too, not
+                        // just the modifier-held one.
+                        run_keyboard_op(enigo, move |e| e.key(k, dir))?;
+                    }
+                    // Named keys (Control/Shift/Alt/Meta/arrows/etc.), plus
+                    // a Unicode press with a modifier held (falls through
+                    // from the first arm above) - both go through a real
+                    // key() press/release, same as this branch always did.
                     _ => run_keyboard_op(enigo, move |e| e.key(k, dir))?,
                 }
             }
