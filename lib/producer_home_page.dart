@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:whixp/whixp.dart' show TransportState;
 
 import 'app_log.dart';
@@ -67,6 +68,15 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   String _connectedJid = '';
   String _sourceName = '';
   bool _logExpanded = false;
+  // Hidden by default for now - reveal is a follow-up keyboard shortcut
+  // (backlog item 4), not yet wired. Kept as a build()-time toggle rather
+  // than deleting the panel/_buildLogPanel() call so that follow-up is a
+  // small diff (flip this from a shortcut handler) instead of re-adding
+  // the panel from scratch.
+  // Deliberately mutable (not final) - will be flipped by the
+  // keyboard-shortcut handler once that follow-up lands.
+  // ignore: prefer_final_fields
+  bool _logPanelVisible = false;
   final ScrollController _logScrollController = ScrollController();
 
   // Guest-code flow (the default entry path): the app connects anonymously
@@ -143,10 +153,38 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _signaling.onTransportStateChanged = _onMediasoupStateChanged;
     _loadDeviceId();
     // Guest flow is the default: connect anonymously on launch so the
-    // customer sees their pairing code without any sign-in step.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    // customer sees their pairing code without any sign-in step. Permissions
+    // are requested first, on this same first frame, so Accessibility/Screen
+    // Recording are asked for before the user ever sees any session UI - not
+    // just at _startCapture() time (see _requestPermissionsOnFirstLaunch()).
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await _requestPermissionsOnFirstLaunch();
       if (mounted && _phase == _Phase.disconnected) _connectGuest();
     });
+  }
+
+  static const _permissionsRequestedKey = 'permissions_requested_v1';
+
+  /// Fires the combined Accessibility + Screen Recording prompt once, on the
+  /// very first launch after install - before any session flow is reachable
+  /// - rather than only at _startCapture() time deep into an accepted
+  /// session. Persisted via shared_preferences so this never re-prompts on
+  /// later launches. The existing SessionPermissions.requestBoth() call in
+  /// _startCapture() is left in place unchanged: it's idempotent (a no-op
+  /// dialog-wise once granted/denied) and stays as a safety net for a user
+  /// who denied here and granted the permission later via System Settings.
+  Future<void> _requestPermissionsOnFirstLaunch() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool(_permissionsRequestedKey) == true) return;
+      await SessionPermissions.requestBoth();
+      await prefs.setBool(_permissionsRequestedKey, true);
+    } catch (e) {
+      // Best-effort, same posture as _loadDeviceId() - a prefs/plugin failure
+      // here must never block the guest-connect flow that follows.
+      _appendLog('[permissions] first-launch request failed: $e');
+    }
   }
 
   Future<void> _loadDeviceId() async {
@@ -993,10 +1031,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       // from the moment the app launches - the whole point of on-screen
       // logging is diagnosing failures that happen before/during sign-in on
       // a packaged .app with no attached terminal (see app_log.dart).
+      // Hidden by default (_logPanelVisible) until a keyboard shortcut to
+      // reveal it lands - see the _logPanelVisible field doc above.
       body: Column(
         children: [
           Expanded(child: _isConnected ? _buildConnectedBody() : _buildStartBody()),
-          _buildLogPanel(),
+          if (_logPanelVisible) _buildLogPanel(),
         ],
       ),
     );
@@ -1292,7 +1332,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _Phase.connected => 'Waiting for an incoming session request…',
     _Phase.sessionIncoming => 'Setting up transports…',
     _Phase.ready => 'Starting screen share…',
-    _Phase.sharing => '',
+    _Phase.sharing => 'Sharing your screen',
     _Phase.error => _statusText,
   };
 
@@ -1397,6 +1437,35 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       );
     }
 
+    if (_phase == _Phase.sharing) {
+      // Deliberately no live preview of the captured stream here (see
+      // _buildPreviewArea() below) - rendering the customer's own capture
+      // back into this same on-screen window would recurse into itself in
+      // whatever's being shared. _renderer still receives the stream
+      // (needed for _startCapture()'s videoWidth/videoHeight-based encoder
+      // downscale detection) - this is purely about what's displayed.
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.screen_share_outlined, size: 40, color: AppColors.textSecondary),
+            const SizedBox(height: 16),
+            Text(
+              _previewPlaceholderText,
+              style: Theme.of(context).textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'The agent can see your screen and control your mouse and keyboard.',
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      );
+    }
+
     return Center(
       child: Text(
         _previewPlaceholderText,
@@ -1429,9 +1498,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
               Positioned.fill(
                 child: Container(
                   color: AppColors.background,
-                  child: _phase == _Phase.sharing
-                      ? RTCVideoView(_renderer, mirror: false)
-                      : _buildPreviewPlaceholder(),
+                  // No RTCVideoView here even while _Phase.sharing: playing
+                  // the customer's own captured screen back into this same
+                  // window would put the app's own preview inside the very
+                  // screen being captured, recursing into itself. See
+                  // _buildPreviewPlaceholder()'s _Phase.sharing branch.
+                  child: _buildPreviewPlaceholder(),
                 ),
               ),
               Positioned(
