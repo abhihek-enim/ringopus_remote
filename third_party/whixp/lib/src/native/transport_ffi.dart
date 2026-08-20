@@ -64,6 +64,7 @@ DynamicLibrary? _loadLib() {
       _lib = DynamicLibrary.process();
     } else if (Platform.isMacOS) {
       _lib = _openByName('libwhixp_transport.dylib') ??
+          _openInAppBundleFrameworks('libwhixp_transport.dylib') ??
           _openFromPackageRoot('macos', 'libwhixp_transport.dylib');
     } else if (Platform.isWindows) {
       _lib = _openByName('whixp_transport.dll') ??
@@ -90,6 +91,26 @@ DynamicLibrary? _openByName(String name) {
   } catch (_) {
     return null;
   }
+}
+
+/// Resolves the dylib relative to the running executable, e.g.
+/// <App>.app/Contents/MacOS/<exe> -> <App>.app/Contents/Frameworks/<name>.
+/// This is what actually works when the app is launched as a real .app
+/// bundle (via Xcode's Run button, Finder double-click, or a distributed
+/// signed build) — a bare DynamicLibrary.open() call doesn't search
+/// Contents/Frameworks by default, and the cwd-relative fallback below only
+/// works when launched via `flutter run` (where cwd happens to be the
+/// project root).
+DynamicLibrary? _openInAppBundleFrameworks(String name) {
+  try {
+    final exeDir = path.dirname(Platform.resolvedExecutable);
+    final frameworksPath =
+        path.join(path.dirname(exeDir), 'Frameworks', name);
+    if (File(frameworksPath).existsSync()) {
+      return DynamicLibrary.open(frameworksPath);
+    }
+  } catch (_) {}
+  return null;
 }
 
 /// Try to open the library from the package root. Tries: (1) one level up from
