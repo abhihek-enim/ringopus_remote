@@ -8,6 +8,7 @@ import 'package:whixp/whixp.dart' show TransportState;
 import 'app_log.dart';
 import 'mediasoup/mediasoup_client.dart';
 import 'mediasoup_signaling.dart';
+import 'permissions.dart';
 import 'router_rtp_capabilities.dart';
 import 'src/rust/api/device_id.dart';
 import 'src/rust/api/input_inject.dart';
@@ -545,6 +546,15 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   }
 
   Future<void> _startCapture() async {
+    // Fire both macOS permission prompts (Accessibility + Screen Recording)
+    // together, up front, before either subsystem gets a chance to trigger
+    // its own dialog lazily and separately (getDisplayMedia below would
+    // otherwise be the one surfacing Screen Recording, and
+    // startInputInjection - only reached after capture succeeds - would
+    // surface Accessibility much later in the flow). No-op if already
+    // granted/denied, so safe to call on every session start.
+    await SessionPermissions.requestBoth();
+
     final List<DesktopCapturerSource> sources;
     try {
       sources = await desktopCapturer.getSources(types: [SourceType.Screen]);
@@ -960,7 +970,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             Expanded(
               child: _isConnected
                   ? Text(_connectedJid, style: appMonoStyle(fontSize: 13), overflow: TextOverflow.ellipsis)
-                  : const Text('Ringopus Remote — Producer'),
+                  : const Text('Oojack Remote — Producer'),
             ),
           ],
         ),
@@ -1012,7 +1022,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text('Ringopus Remote', style: Theme.of(context).textTheme.titleLarge),
+                  Text('Oojack Remote', style: Theme.of(context).textTheme.titleLarge),
                   const SizedBox(height: 4),
                   Text(
                     'Get a share code and read it to your support agent.',

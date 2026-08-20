@@ -14,6 +14,13 @@ analyzer:
     # Vendored third-party source (see lib/mediasoup/mediasoup_client.dart
     # for provenance) - not held to this project's lint rules.
     - lib/mediasoup/**
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**
 
 linter:
   # The lint rules applied to this project can be customized in the

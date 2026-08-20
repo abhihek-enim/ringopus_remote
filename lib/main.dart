@@ -45,7 +45,7 @@ class RingopusProducerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Ringopus Remote Producer',
+      title: 'Oojack Remote Producer',
       theme: buildAppTheme(),
       home: const ProducerHomePage(),
     );
