@@ -1,5 +1,5 @@
 ; ============================================================================
-; Ringopus Remote (producer app) - Windows installer
+; Oojack Remote (producer app) - Windows installer
 ;
 ; Packages the Flutter release build produced by:
 ;   flutter build windows --release
@@ -24,9 +24,9 @@ Unicode true
 ; PRODUCT_APP_ID must stay the same across releases (it's the upgrade/
 ; duplicate-install identity key) - only regenerate it if this ever becomes
 ; a genuinely different product.
-!define PRODUCT_NAME             "Ringopus Remote"
+!define PRODUCT_NAME             "Oojack Remote"
 !define PRODUCT_EXE              "ringopus_remote_producer.exe"
-!define PRODUCT_PUBLISHER        "Ringopus"
+!define PRODUCT_PUBLISHER        "Oojack"
 !define PRODUCT_VERSION          "1.0.0.1"   ; must be X.X.X.X, keep in sync with pubspec.yaml's version+build
 !define PRODUCT_VERSION_DISPLAY  "1.0.0"     ; human-readable, shown in Add/Remove Programs
 !define PRODUCT_APP_ID           "8F1E4C2A-9B3D-4A6E-8C71-2D5E9F6A1B34"
