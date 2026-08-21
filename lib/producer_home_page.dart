@@ -103,6 +103,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   String? _transientBanner;
   Timer? _transientBannerTimer;
 
+  // Dock-to-corner (replaces the earlier minimize-on-share behavior): the
+  // window's size/position from just before docking, restored verbatim on
+  // session end. Null whenever the window isn't currently docked.
+  Rect? _preDockBounds;
+
   // Chat (Phase 2). Purely additive to the JSON-over-message channel — no
   // whixp/XMPP protocol changes, same as every other message type here.
   // _chatAvailable reflects the server's chatAvailable flag on transport-
@@ -306,7 +311,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _appendLog('[mediasoup] device loaded from real router-rtp-capabilities');
         if (_guestMode) {
           _setPhase(_Phase.connected, 'Requesting your share code…');
-          _xmpp?.sendToComponent({'type': 'guest-code-request'});
+          _xmpp?.sendToComponent({
+            'type': 'guest-code-request',
+            if (_deviceId != null) 'deviceId': _deviceId,
+          });
         } else {
           _setPhase(_Phase.connected, 'Ready — waiting for an incoming session request…');
         }
@@ -321,7 +329,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'guest-code-expired':
         _appendLog('[guest] share code expired — requesting a fresh one');
         if (mounted) setState(() => _guestCode = '');
-        _xmpp?.sendToComponent({'type': 'guest-code-request'});
+        _xmpp?.sendToComponent({
+          'type': 'guest-code-request',
+          if (_deviceId != null) 'deviceId': _deviceId,
+        });
 
       case 'session-incoming':
         if (_phase == _Phase.sessionIncoming ||
@@ -559,7 +570,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   void _refreshGuestCode() {
     if (!_guestMode || _xmpp == null || !_xmppConnected) return;
     if (mounted) setState(() => _guestCode = '');
-    _xmpp!.sendToComponent({'type': 'guest-code-request'});
+    _xmpp!.sendToComponent({
+      'type': 'guest-code-request',
+      if (_deviceId != null) 'deviceId': _deviceId,
+    });
   }
 
   void _sendChatMessage() {
@@ -579,6 +593,37 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _chatScrollController.jumpTo(_chatScrollController.position.maxScrollExtent);
       }
     });
+  }
+
+  // Docked window size while sharing — small enough to stay out of the way,
+  // tall enough for the chat panel's message list + compose box to still be
+  // usable.
+  static const Size _dockedSize = Size(340, 520);
+
+  /// Shrinks the window to a small bottom-right, always-on-top dock instead
+  /// of the old minimize-on-share behavior — the customer keeps the chat
+  /// panel visible/reachable while the agent works, rather than the app
+  /// disappearing from view entirely. `setSize` before `setAlignment`
+  /// (alignment is computed from the window's *current* size).
+  Future<void> _dockToCorner() async {
+    _preDockBounds = await windowManager.getBounds();
+    await windowManager.setResizable(false);
+    await windowManager.setSize(_dockedSize);
+    await windowManager.setAlignment(Alignment.bottomRight);
+    await windowManager.setAlwaysOnTop(true);
+    if (mounted) setState(() {});
+  }
+
+  /// Reverses _dockToCorner. Safe to call even if never docked (no-op via
+  /// the null check) - every _teardownSession path funnels through here.
+  Future<void> _undockAndRestore() async {
+    final bounds = _preDockBounds;
+    if (bounds == null) return;
+    _preDockBounds = null;
+    await windowManager.setAlwaysOnTop(false);
+    await windowManager.setResizable(true);
+    await windowManager.setBounds(bounds);
+    if (mounted) setState(() {});
   }
 
   Future<void> _startCapture() async {
@@ -620,13 +665,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       _renderer.srcObject = stream;
       setState(() => _sourceName = source.name);
       _setPhase(_Phase.sharing, 'Sharing “${source.name}”');
-      // Get the app out of the way the instant sharing actually starts -
-      // a support customer has no reason to keep looking at this window
-      // once the agent can see their screen, and it doubles as a second
-      // guard against this app's own window ever showing up inside the
-      // capture (the in-app preview loopback is handled separately, see
+      // Dock to a small always-on-top corner the instant sharing actually
+      // starts, instead of minimizing - the customer keeps the chat panel
+      // reachable while the agent works. Also doubles as a second guard
+      // against this app's own window ever showing up inside the capture
+      // (the in-app preview loopback is handled separately, see
       // _buildPreviewPlaceholder()'s _Phase.sharing branch above).
-      unawaited(windowManager.minimize());
+      unawaited(_dockToCorner());
       _tearingDown = false; // fresh session - re-arm the teardown choke point
       // Input injection is independent of video capture/produce - a Rust
       // bridge failure here (e.g. a debug-build content-hash mismatch) must
@@ -782,6 +827,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   Future<void> _teardownSession({required _TeardownReason reason, bool notifyPeer = true}) async {
     if (_tearingDown) return;
     _tearingDown = true;
+    unawaited(_undockAndRestore()); // no-op if never docked this session
 
     final sid = _signaling.sid;
     if (notifyPeer && sid.isNotEmpty && _xmpp != null) {
@@ -789,16 +835,31 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _xmpp!.sendToComponent({'type': 'session-terminate', 'sid': sid, 'reason': reason.name});
       } catch (_) {}
     }
-    await _stopSharingLocally();
-    // A Rust bridge failure here must not skip the rest of teardown
-    // (signaling cleanup, timer cancellation, phase reset) - those are all
-    // independent of input injection.
+    // Every cleanup call below is independently try/caught: a failure in ANY
+    // one of them (WebRTC stream/track disposal, the Rust input bridge,
+    // native mediasoup transport close) must not skip the rest of teardown -
+    // above all, must not skip the phase reset a few lines down. Before this
+    // guard existed, an exception here (e.g. closing a transport mid-
+    // negotiation) silently left the app stuck in _Phase.sharing/.ready
+    // forever, and the session-incoming guard above then silently dropped
+    // every future request with no error shown anywhere - the app looked
+    // "stuck" or "unresponsive" with no diagnostic beyond the (hidden-by-
+    // default) log panel. See decision_log.md.
+    try {
+      await _stopSharingLocally();
+    } catch (e) {
+      _appendLog('_stopSharingLocally failed: $e');
+    }
     try {
       await stopInputInjection();
     } catch (e) {
       _appendLog('stopInputInjection failed: $e');
     }
-    await _signaling.cleanup();
+    try {
+      await _signaling.cleanup();
+    } catch (e) {
+      _appendLog('_signaling.cleanup failed: $e');
+    }
     _agentOnHold = false;
     _xmppReconnecting = false;
     _mediasoupRecovering = false;
@@ -1000,6 +1061,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // Docked, always-on-top, small — the whole window IS the chat panel
+    // while sharing. See _dockToCorner()/_undockAndRestore().
+    if (_phase == _Phase.sharing) {
+      return Scaffold(body: SafeArea(child: _buildDockedView()));
+    }
     return Scaffold(
       appBar: AppBar(
         title: Row(
@@ -1212,49 +1278,111 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             ),
           ),
           const Divider(height: 1, color: AppColors.hairline),
-          Expanded(
-            child: _chatMessages.isEmpty
-                ? Center(
-                    child: Text(
-                      'No messages yet',
-                      style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _chatScrollController,
-                    padding: const EdgeInsets.all(12),
-                    itemCount: _chatMessages.length,
-                    itemBuilder: (context, i) => _buildChatBubble(_chatMessages[i]),
-                  ),
-          ),
-          const Divider(height: 1, color: AppColors.hairline),
-          Padding(
-            padding: const EdgeInsets.all(10),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _chatController,
-                    style: const TextStyle(fontSize: 13),
-                    decoration: const InputDecoration(
-                      hintText: 'Message…',
-                      isDense: true,
-                      contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-                    ),
-                    onSubmitted: (_) => _sendChatMessage(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                IconButton(
-                  tooltip: 'Send',
-                  icon: const Icon(Icons.send, size: 18),
-                  onPressed: _sendChatMessage,
-                ),
-              ],
-            ),
-          ),
+          Expanded(child: _buildChatBody()),
         ],
       ),
+    );
+  }
+
+  /// Message list + compose row, shared between the normal fixed-width chat
+  /// panel above and the docked compact view below — the only thing that
+  /// differs between them is the surrounding chrome (header/close button vs.
+  /// a slim status bar), not this part.
+  Widget _buildChatBody() {
+    return Column(
+      children: [
+        Expanded(
+          child: _chatMessages.isEmpty
+              ? Center(
+                  child: Text(
+                    'No messages yet',
+                    style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                  ),
+                )
+              : ListView.builder(
+                  controller: _chatScrollController,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: _chatMessages.length,
+                  itemBuilder: (context, i) => _buildChatBubble(_chatMessages[i]),
+                ),
+        ),
+        const Divider(height: 1, color: AppColors.hairline),
+        Padding(
+          padding: const EdgeInsets.all(10),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _chatController,
+                  style: const TextStyle(fontSize: 13),
+                  decoration: const InputDecoration(
+                    hintText: 'Message…',
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                  ),
+                  onSubmitted: (_) => _sendChatMessage(),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                tooltip: 'Send',
+                icon: const Icon(Icons.send, size: 18),
+                onPressed: _sendChatMessage,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The whole window's content while docked (_Phase.sharing) — a slim
+  /// status bar plus the chat body filling the rest of the small window. No
+  /// AppBar, no preview area, no log panel: the point of docking is to get
+  /// everything but chat out of the way. Falls back to a plain status card
+  /// when this session has no chat room (chatAvailable false) — there's
+  /// nothing to dock a chat view around in that case.
+  Widget _buildDockedView() {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: const BoxDecoration(
+            border: Border(bottom: BorderSide(color: AppColors.hairline)),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(color: _statusDotColor, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Sharing your screen',
+                  style: Theme.of(context).textTheme.titleSmall,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: _chatAvailable
+              ? _buildChatBody()
+              : Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(
+                      'Sharing your screen with the agent.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                    ),
+                  ),
+                ),
+        ),
+      ],
     );
   }
 
