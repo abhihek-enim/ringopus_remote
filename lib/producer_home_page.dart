@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:whixp/whixp.dart' show TransportState;
 import 'package:window_manager/window_manager.dart';
@@ -79,13 +80,32 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   bool _logPanelVisible = false;
   final ScrollController _logScrollController = ScrollController();
 
-  // Guest-code flow (the default entry path): the app connects anonymously
-  // to guest.ringopus, asks the orchestrator for a short pairing code, and
-  // the agent redeems that code instead of dialing a JID. The legacy
-  // JID/password sign-in survives behind the "Advanced" toggle below.
+  // Guest-code flow (the default entry path): the app connects via a
+  // persistent per-device identity (see _connectPersistent()) and asks the
+  // orchestrator for a short pairing code, which the agent redeems instead
+  // of dialing a JID. The legacy JID/password sign-in survives behind the
+  // "Advanced" toggle below. _guestMode still means "auto-connected, no
+  // manual sign-in UI" - it no longer implies an anonymous XMPP identity,
+  // see decision.md ("persistent per-device identity via a registered
+  // user.oojack ejabberd account").
   bool _guestMode = false;
   String _guestCode = ''; // raw digits; rendered grouped XXX-XXX-XXX
   bool _showLegacyLogin = false;
+
+  // useDataProtectionKeyChain: false - the default (true) routes through
+  // macOS's newer Data Protection Keychain, which requires a full App ID
+  // provisioning profile (SecItemAdd fails errSecMissingEntitlement/-34018
+  // otherwise, confirmed live - a plain keychain-access-groups entitlement
+  // does NOT fix this, it just adds an unrelated provisioning-profile
+  // requirement, since flutter_secure_storage_macos only sets an access
+  // group when one is explicitly configured, which this isn't). false falls
+  // back to the legacy per-app keychain, which works with this app's
+  // existing Apple Development signing - no special provisioning needed.
+  static const _secureStorage = FlutterSecureStorage(
+    mOptions: MacOsOptions(useDataProtectionKeyChain: false),
+  );
+  static const _deviceJidKey = 'device_identity_jid';
+  static const _devicePasswordKey = 'device_identity_password';
 
   // Consent gate for session-incoming: nothing is accepted until the
   // customer clicks Allow. Auto-declines after a minute so an unanswered
@@ -142,22 +162,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   final Set<String> _mediasoupNeedingRecovery = {}; // labels ('send'/'recv') currently dropped and being recovered
   Timer? _mediasoupReconnectDeadline; // single overall give-up timer for the whole reconnect episode
 
-  // Customer Identity v2 (see ~/.claude/plans/prompt-plan-multi-session-
-  // support-distributed-nova.md, Part A) — a self-reported, MAC-derived
-  // device id, read once at startup and reused for every session-accept
-  // this run (Part B). Null until _loadDeviceId() resolves; a session
-  // started before it resolves simply omits deviceId (best-effort, not
-  // blocking on it — this is not a security mechanism).
-  String? _deviceId;
-  String? _adapterKind;
-
   @override
   void initState() {
     super.initState();
     _renderer.initialize();
     _signaling.onTransportStateChanged = _onMediasoupStateChanged;
-    _loadDeviceId();
-    // Guest flow is the default: connect anonymously on launch so the
+    // Auto-connect on launch, via the persistent device identity, so the
     // customer sees their pairing code without any sign-in step. Permissions
     // are requested first, on this same first frame, so Accessibility/Screen
     // Recording are asked for before the user ever sees any session UI - not
@@ -165,7 +175,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
       await _requestPermissionsOnFirstLaunch();
-      if (mounted && _phase == _Phase.disconnected) _connectGuest();
+      if (mounted && _phase == _Phase.disconnected) _connectPersistent();
     });
   }
 
@@ -186,22 +196,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       await SessionPermissions.requestBoth();
       await prefs.setBool(_permissionsRequestedKey, true);
     } catch (e) {
-      // Best-effort, same posture as _loadDeviceId() - a prefs/plugin failure
-      // here must never block the guest-connect flow that follows.
+      // Best-effort - a prefs/plugin failure here must never block the
+      // guest-connect flow that follows.
       _appendLog('[permissions] first-launch request failed: $e');
-    }
-  }
-
-  Future<void> _loadDeviceId() async {
-    try {
-      final info = await getDeviceId();
-      _deviceId = info.deviceId;
-      _adapterKind = info.adapterKind;
-      _appendLog('[identity] deviceId ready (adapterKind=${info.adapterKind})');
-    } catch (e) {
-      // Best-effort by design (see plan Part A) — no deviceId this run is a
-      // normal degraded state, not an error condition to surface to the user.
-      _appendLog('[identity] could not determine deviceId: $e');
     }
   }
 
@@ -269,6 +266,100 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _startXmpp(XmppClient.guest());
   }
 
+  /// The default entry point since the persistent-identity redesign
+  /// (decision.md): use stored device-identity credentials if this device
+  /// has already been provisioned, otherwise provision it now. Either way
+  /// the customer sees the same "connected -> pairing code" flow as before -
+  /// this only changes what's underneath the XMPP connection.
+  Future<void> _connectPersistent() async {
+    _guestMode = true;
+    String? jid;
+    String? password;
+    try {
+      jid = await _secureStorage.read(key: _deviceJidKey);
+      password = await _secureStorage.read(key: _devicePasswordKey);
+    } catch (e) {
+      _appendLog('[identity] secure storage read failed: $e');
+    }
+    if (!mounted) return;
+    if (jid != null && password != null) {
+      final xmpp = XmppClient(jid, password);
+      _startXmpp(xmpp);
+      // _startXmpp() already wires a generic onAuthFailed - wrap it so a
+      // rejected stored credential (e.g. the account was deleted or reset
+      // server-side, which this project's own server-migration history
+      // shows can genuinely happen) clears it instead of retrying the same
+      // broken credential forever on every future launch.
+      final generic = xmpp.onAuthFailed;
+      xmpp.onAuthFailed = () async {
+        _appendLog('[identity] stored device credentials rejected — clearing for re-provisioning');
+        await _secureStorage.delete(key: _deviceJidKey);
+        await _secureStorage.delete(key: _devicePasswordKey);
+        generic?.call();
+      };
+      return;
+    }
+    await _provisionDeviceIdentity();
+  }
+
+  /// First-ever launch (or a previously-cleared identity): connect
+  /// anonymously just long enough to register a persistent per-device
+  /// ejabberd account, store its credentials, then reconnect for real using
+  /// them. Falls back to a plain anonymous connection (the pre-redesign
+  /// behavior) if registration fails for any reason - provisioning must
+  /// never be a hard blocker to using the app.
+  Future<void> _provisionDeviceIdentity() async {
+    DeviceIdInfo info;
+    try {
+      info = await getDeviceId();
+    } catch (e) {
+      _appendLog('[identity] could not determine deviceId, connecting anonymously: $e');
+      _connectGuest();
+      return;
+    }
+
+    final bootstrap = XmppClient.guest();
+    final registered = Completer<Map<String, dynamic>?>();
+    bootstrap.onComponentMessage = (msg) {
+      if (msg['type'] == 'device-registered' || msg['type'] == 'device-registration-failed') {
+        if (!registered.isCompleted) registered.complete(msg);
+      }
+    };
+    bootstrap.onConnected = (_) {
+      bootstrap.sendToComponent({'type': 'register-device', 'deviceId': info.deviceId});
+    };
+    bootstrap.onAuthFailed = () {
+      if (!registered.isCompleted) registered.complete(null);
+    };
+    bootstrap.connect();
+
+    final result = await registered.future.timeout(
+      const Duration(seconds: 15),
+      onTimeout: () => null,
+    );
+    bootstrap.disconnect();
+    if (!mounted) return;
+
+    if (result != null && result['type'] == 'device-registered') {
+      final jid = result['jid'] as String;
+      final password = result['password'] as String;
+      try {
+        await _secureStorage.write(key: _deviceJidKey, value: jid);
+        await _secureStorage.write(key: _devicePasswordKey, value: password);
+      } catch (e) {
+        // Best-effort - if this device can't persist credentials it just
+        // re-provisions (a fresh account) on every future launch rather
+        // than failing to connect at all.
+        _appendLog('[identity] failed to persist device credentials: $e');
+      }
+      if (!mounted) return;
+      _startXmpp(XmppClient(jid, password));
+    } else {
+      _appendLog('[identity] device registration failed or timed out — connecting anonymously');
+      _connectGuest();
+    }
+  }
+
   void _startXmpp(XmppClient xmpp) {
     _xmpp = xmpp;
     xmpp.onConnected = (boundJid) {
@@ -282,7 +373,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       _setPhase(
         _Phase.error,
         _guestMode
-            ? 'Could not start a guest session — check the server'
+            ? 'Could not connect — check the server'
             : 'Login failed — check JID/password',
       );
     };
@@ -311,10 +402,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _appendLog('[mediasoup] device loaded from real router-rtp-capabilities');
         if (_guestMode) {
           _setPhase(_Phase.connected, 'Requesting your share code…');
-          _xmpp?.sendToComponent({
-            'type': 'guest-code-request',
-            if (_deviceId != null) 'deviceId': _deviceId,
-          });
+          _xmpp?.sendToComponent({'type': 'guest-code-request'});
         } else {
           _setPhase(_Phase.connected, 'Ready — waiting for an incoming session request…');
         }
@@ -329,10 +417,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'guest-code-expired':
         _appendLog('[guest] share code expired — requesting a fresh one');
         if (mounted) setState(() => _guestCode = '');
-        _xmpp?.sendToComponent({
-          'type': 'guest-code-request',
-          if (_deviceId != null) 'deviceId': _deviceId,
-        });
+        _xmpp?.sendToComponent({'type': 'guest-code-request'});
 
       case 'session-incoming':
         if (_phase == _Phase.sessionIncoming ||
@@ -533,13 +618,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       // somehow isn't loaded (it always is by accept time).
       'rtpCapabilities':
           _signaling.device?.rtpCapabilities.toMap() ?? routerRtpCapabilitiesJson,
-      // Customer Identity v2, Part B — rides on this existing message
-      // rather than a separate post-connect one (see the plan). Omitted
-      // entirely (not sent as null) if _loadDeviceId() hasn't resolved yet;
-      // the server treats a missing deviceId as "no identity this session",
-      // same as today.
-      if (_deviceId != null) 'deviceId': _deviceId,
-      if (_adapterKind != null) 'adapterKind': _adapterKind,
     });
     _setPhase(_Phase.sessionIncoming, 'Session accepted — setting up transports…');
   }
@@ -570,10 +648,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   void _refreshGuestCode() {
     if (!_guestMode || _xmpp == null || !_xmppConnected) return;
     if (mounted) setState(() => _guestCode = '');
-    _xmpp!.sendToComponent({
-      'type': 'guest-code-request',
-      if (_deviceId != null) 'deviceId': _deviceId,
-    });
+    _xmpp!.sendToComponent({'type': 'guest-code-request'});
   }
 
   void _sendChatMessage() {
@@ -1155,7 +1230,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                     )
                   else
                     FilledButton(
-                      onPressed: _connectGuest,
+                      onPressed: _connectPersistent,
                       child: Text(_phase == _Phase.error ? 'Retry' : 'Get a share code'),
                     ),
                   if (_phase == _Phase.error) ...[
@@ -1467,7 +1542,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _Phase.connected => 'Waiting for an incoming session request…',
     _Phase.sessionIncoming => 'Setting up transports…',
     _Phase.ready => 'Starting screen share…',
-    _Phase.sharing => 'Sharing your screen',
+    _Phase.sharing => '',
     _Phase.error => _statusText,
   };
 
@@ -1572,35 +1647,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       );
     }
 
-    if (_phase == _Phase.sharing) {
-      // Deliberately no live preview of the captured stream here (see
-      // _buildPreviewArea() below) - rendering the customer's own capture
-      // back into this same on-screen window would recurse into itself in
-      // whatever's being shared. _renderer still receives the stream
-      // (needed for _startCapture()'s videoWidth/videoHeight-based encoder
-      // downscale detection) - this is purely about what's displayed.
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.screen_share_outlined, size: 40, color: AppColors.textSecondary),
-            const SizedBox(height: 16),
-            Text(
-              _previewPlaceholderText,
-              style: Theme.of(context).textTheme.titleMedium,
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 6),
-            Text(
-              'The agent can see your screen and control your mouse and keyboard.',
-              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
-              textAlign: TextAlign.center,
-            ),
-          ],
-        ),
-      );
-    }
-
     return Center(
       child: Text(
         _previewPlaceholderText,
@@ -1633,12 +1679,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
               Positioned.fill(
                 child: Container(
                   color: AppColors.background,
-                  // No RTCVideoView here even while _Phase.sharing: playing
-                  // the customer's own captured screen back into this same
-                  // window would put the app's own preview inside the very
-                  // screen being captured, recursing into itself. See
-                  // _buildPreviewPlaceholder()'s _Phase.sharing branch.
-                  child: _buildPreviewPlaceholder(),
+                  child: _phase == _Phase.sharing
+                      ? RTCVideoView(_renderer, mirror: false)
+                      : _buildPreviewPlaceholder(),
                 ),
               ),
               Positioned(

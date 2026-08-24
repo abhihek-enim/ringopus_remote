@@ -53,6 +53,10 @@ dependencies:
   google_fonts: ^8.1.0
   shared_preferences: ^2.3.3
   window_manager: ^0.4.3
+  # Keychain (macOS) / DPAPI (Windows) - backed storage for the persistent
+  # device identity's real ejabberd password. Never shared_preferences,
+  # which is plaintext - see decision.md.
+  flutter_secure_storage: ^9.2.2
 
 dev_dependencies:
   flutter_test:
