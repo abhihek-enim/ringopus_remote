@@ -6,8 +6,8 @@
 // Static analysis wrongly picks the IO variant, thus ignore this
 // ignore_for_file: argument_type_not_assignable
 
-import 'api/device_id.dart';
 import 'api/input_inject.dart';
+import 'api/persistent_identity.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'frb_generated.dart';
@@ -25,7 +25,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
-  DeviceIdInfo dco_decode_device_id_info(dynamic raw);
+  DeviceIdentity dco_decode_device_identity(dynamic raw);
 
   @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
@@ -40,7 +40,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
-  DeviceIdInfo sse_decode_device_id_info(SseDeserializer deserializer);
+  DeviceIdentity sse_decode_device_identity(SseDeserializer deserializer);
 
   @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
@@ -61,7 +61,10 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
-  void sse_encode_device_id_info(DeviceIdInfo self, SseSerializer serializer);
+  void sse_encode_device_identity(
+    DeviceIdentity self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_prim_u_8_strict(

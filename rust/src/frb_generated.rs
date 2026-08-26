@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1546257413;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 644000415;
 
 // Section: executor
 
@@ -46,7 +46,7 @@ flutter_rust_bridge::frb_generated_default_handler!();
 
 // Section: wire_funcs
 
-fn wire__crate__api__device_id__get_device_id_impl(
+fn wire__crate__api__persistent_identity__derive_identity_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -54,7 +54,41 @@ fn wire__crate__api__device_id__get_device_id_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "get_device_id",
+            debug_name: "derive_identity",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_master_key_hex = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok =
+                        crate::api::persistent_identity::derive_identity(api_master_key_hex)?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__persistent_identity__generate_master_key_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "generate_master_key",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -71,7 +105,7 @@ fn wire__crate__api__device_id__get_device_id_impl(
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, String>((move || {
-                    let output_ok = crate::api::device_id::get_device_id()?;
+                    let output_ok = crate::api::persistent_identity::generate_master_key()?;
                     Ok(output_ok)
                 })())
             }
@@ -224,14 +258,16 @@ impl SseDecode for String {
     }
 }
 
-impl SseDecode for crate::api::device_id::DeviceIdInfo {
+impl SseDecode for crate::api::persistent_identity::DeviceIdentity {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_deviceId = <String>::sse_decode(deserializer);
-        let mut var_adapterKind = <String>::sse_decode(deserializer);
-        return crate::api::device_id::DeviceIdInfo {
-            device_id: var_deviceId,
-            adapter_kind: var_adapterKind,
+        let mut var_jidLocalpart = <String>::sse_decode(deserializer);
+        let mut var_xmppPassword = <String>::sse_decode(deserializer);
+        let mut var_connectCode = <String>::sse_decode(deserializer);
+        return crate::api::persistent_identity::DeviceIdentity {
+            jid_localpart: var_jidLocalpart,
+            xmpp_password: var_xmppPassword,
+            connect_code: var_connectCode,
         };
     }
 }
@@ -283,16 +319,27 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        1 => wire__crate__api__device_id__get_device_id_impl(port, ptr, rust_vec_len, data_len),
-        2 => wire__crate__api__input_inject__init_app_impl(port, ptr, rust_vec_len, data_len),
-        3 => wire__crate__api__input_inject__inject_input_impl(port, ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__input_inject__start_input_injection_impl(
+        1 => wire__crate__api__persistent_identity__derive_identity_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        5 => wire__crate__api__input_inject__stop_input_injection_impl(
+        2 => wire__crate__api__persistent_identity__generate_master_key_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        3 => wire__crate__api__input_inject__init_app_impl(port, ptr, rust_vec_len, data_len),
+        4 => wire__crate__api__input_inject__inject_input_impl(port, ptr, rust_vec_len, data_len),
+        5 => wire__crate__api__input_inject__start_input_injection_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        6 => wire__crate__api__input_inject__stop_input_injection_impl(
             port,
             ptr,
             rust_vec_len,
@@ -317,23 +364,24 @@ fn pde_ffi_dispatcher_sync_impl(
 // Section: rust2dart
 
 // Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::device_id::DeviceIdInfo {
+impl flutter_rust_bridge::IntoDart for crate::api::persistent_identity::DeviceIdentity {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
-            self.device_id.into_into_dart().into_dart(),
-            self.adapter_kind.into_into_dart().into_dart(),
+            self.jid_localpart.into_into_dart().into_dart(),
+            self.xmpp_password.into_into_dart().into_dart(),
+            self.connect_code.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
 }
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
-    for crate::api::device_id::DeviceIdInfo
+    for crate::api::persistent_identity::DeviceIdentity
 {
 }
-impl flutter_rust_bridge::IntoIntoDart<crate::api::device_id::DeviceIdInfo>
-    for crate::api::device_id::DeviceIdInfo
+impl flutter_rust_bridge::IntoIntoDart<crate::api::persistent_identity::DeviceIdentity>
+    for crate::api::persistent_identity::DeviceIdentity
 {
-    fn into_into_dart(self) -> crate::api::device_id::DeviceIdInfo {
+    fn into_into_dart(self) -> crate::api::persistent_identity::DeviceIdentity {
         self
     }
 }
@@ -345,11 +393,12 @@ impl SseEncode for String {
     }
 }
 
-impl SseEncode for crate::api::device_id::DeviceIdInfo {
+impl SseEncode for crate::api::persistent_identity::DeviceIdentity {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <String>::sse_encode(self.device_id, serializer);
-        <String>::sse_encode(self.adapter_kind, serializer);
+        <String>::sse_encode(self.jid_localpart, serializer);
+        <String>::sse_encode(self.xmpp_password, serializer);
+        <String>::sse_encode(self.connect_code, serializer);
     }
 }
 

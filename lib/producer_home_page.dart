@@ -3,18 +3,18 @@ import 'dart:async';
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:whixp/whixp.dart' show TransportState;
 import 'package:window_manager/window_manager.dart';
 
 import 'app_log.dart';
+import 'identity_store.dart';
 import 'mediasoup/mediasoup_client.dart';
 import 'mediasoup_signaling.dart';
 import 'permissions.dart';
 import 'router_rtp_capabilities.dart';
-import 'src/rust/api/device_id.dart';
 import 'src/rust/api/input_inject.dart';
+import 'src/rust/api/persistent_identity.dart';
 import 'theme.dart';
 import 'xmpp/xmpp_client.dart';
 
@@ -28,7 +28,22 @@ class ProducerHomePage extends StatefulWidget {
   State<ProducerHomePage> createState() => _ProducerHomePageState();
 }
 
-enum _Phase { disconnected, connecting, connected, sessionIncoming, ready, sharing, error }
+enum _Phase {
+  disconnected,
+  connecting,
+  connected,
+  sessionIncoming,
+  ready,
+  sharing,
+  error,
+  // This device's identity couldn't be found (secure storage wiped, a
+  // deep/manual uninstall, a different OS user account — spec §7's
+  // scenario list). A distinct top-level phase, not an orthogonal flag
+  // within an existing one, because it replaces the entire home screen
+  // with an explicit confirmation gate rather than layering onto the
+  // normal connect/pairing-code flow. See _enterLostIdentityRecovery().
+  identityRecovery,
+}
 
 /// One chat line. `fromMe` distinguishes local echo of our own sends from
 /// incoming agent messages; `from` is the agent's display name (unused when
@@ -92,20 +107,20 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   String _guestCode = ''; // raw digits; rendered grouped XXX-XXX-XXX
   bool _showLegacyLogin = false;
 
-  // useDataProtectionKeyChain: false - the default (true) routes through
-  // macOS's newer Data Protection Keychain, which requires a full App ID
-  // provisioning profile (SecItemAdd fails errSecMissingEntitlement/-34018
-  // otherwise, confirmed live - a plain keychain-access-groups entitlement
-  // does NOT fix this, it just adds an unrelated provisioning-profile
-  // requirement, since flutter_secure_storage_macos only sets an access
-  // group when one is explicitly configured, which this isn't). false falls
-  // back to the legacy per-app keychain, which works with this app's
-  // existing Apple Development signing - no special provisioning needed.
-  static const _secureStorage = FlutterSecureStorage(
-    mOptions: MacOsOptions(useDataProtectionKeyChain: false),
-  );
-  static const _deviceJidKey = 'device_identity_jid';
-  static const _devicePasswordKey = 'device_identity_password';
+  // Permanent, HKDF-derived 12-digit connect code (see identity_store.dart
+  // and rust/src/api/persistent_identity.rs) — non-null once a persistent
+  // identity is established. Distinct from _guestCode (the ephemeral
+  // 9-digit fallback, still used when this device has no identity at all
+  // and connects fully anonymously). Never re-requested/refreshed like
+  // _guestCode is — it's constant for the lifetime of the MasterKey.
+  String? _permanentConnectCode;
+
+  // The vhost that holds every persistent per-device identity — see
+  // decision.md ("Persistent MasterKey-derived device identity"). The
+  // server used to hand back a complete jid string on registration; now
+  // the client derives everything itself and must know this domain to
+  // construct its own full JID.
+  static const _deviceIdentityVhost = 'user.oojack';
 
   // Consent gate for session-incoming: nothing is accepted until the
   // customer clicks Allow. Auto-declines after a minute so an unanswered
@@ -266,58 +281,133 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _startXmpp(XmppClient.guest());
   }
 
-  /// The default entry point since the persistent-identity redesign
-  /// (decision.md): use stored device-identity credentials if this device
-  /// has already been provisioned, otherwise provision it now. Either way
-  /// the customer sees the same "connected -> pairing code" flow as before -
-  /// this only changes what's underneath the XMPP connection.
+  /// The default entry point. Implements the Migration state machine from
+  /// ~/.claude/plans/vast-dreaming-haven.md — dispatches on the durably-true
+  /// local facts (MasterKey present? legacy sha256(mac) credentials
+  /// present? was this device ever provisioned before?) rather than any
+  /// remembered in-progress state, so every branch is safe to re-enter from
+  /// scratch after a crash.
   Future<void> _connectPersistent() async {
     _guestMode = true;
-    String? jid;
-    String? password;
+    String? masterKey;
     try {
-      jid = await _secureStorage.read(key: _deviceJidKey);
-      password = await _secureStorage.read(key: _devicePasswordKey);
+      masterKey = await IdentityStore.loadMasterKey();
     } catch (e) {
       _appendLog('[identity] secure storage read failed: $e');
     }
     if (!mounted) return;
-    if (jid != null && password != null) {
-      final xmpp = XmppClient(jid, password);
-      _startXmpp(xmpp);
-      // _startXmpp() already wires a generic onAuthFailed - wrap it so a
-      // rejected stored credential (e.g. the account was deleted or reset
-      // server-side, which this project's own server-migration history
-      // shows can genuinely happen) clears it instead of retrying the same
-      // broken credential forever on every future launch.
-      final generic = xmpp.onAuthFailed;
-      xmpp.onAuthFailed = () async {
-        _appendLog('[identity] stored device credentials rejected — clearing for re-provisioning');
-        await _secureStorage.delete(key: _deviceJidKey);
-        await _secureStorage.delete(key: _devicePasswordKey);
-        generic?.call();
-      };
+
+    if (masterKey != null) {
+      DeviceIdentity identity;
+      try {
+        identity = await deriveIdentity(masterKeyHex: masterKey);
+      } catch (e) {
+        // A present-but-corrupted MasterKey must be treated exactly like a
+        // lost one — never silently regenerate, never let this crash the
+        // app (spec §7).
+        _appendLog('[identity] stored MasterKey is corrupted/unreadable: $e');
+        await _enterLostIdentityRecovery();
+        return;
+      }
+      if (mounted) setState(() => _permanentConnectCode = identity.connectCode);
+
+      final legacy = await IdentityStore.loadLegacyCredentials();
+      if (legacy != null) {
+        // Migration case 3: the new identity is already provisioned and
+        // confirmed working (we have a valid MasterKey) — finish retiring
+        // the old account FIRST, sequentially, then connect for real.
+        // Never run this concurrently with the real connection: two
+        // XmppClient/Whixp connections open at once from this app is not
+        // safe — the native transport's SASL/stream state gets confused
+        // across them (confirmed live: garbled SCRAM-SHA-1/PLAIN failures
+        // on both connections when this was tried concurrently). Safely
+        // repeatable if this was already attempted and interrupted on an
+        // earlier launch.
+        await _finishLegacyCleanup(legacy);
+        if (!mounted) return;
+        _connectWithDerivedIdentity(identity);
+        return;
+      }
+
+      if (!await IdentityStore.wasEverProvisioned()) {
+        // MasterKey was persisted but registration never finished (e.g. a
+        // crash mid-attempt) — resume by (idempotently) re-registering this
+        // same identity, then connect regardless so a slow/offline
+        // registration attempt never blocks the app from being usable this
+        // session. A successful connect via _connectWithDerivedIdentity is
+        // itself the confirmation and calls markProvisioned() — no separate
+        // probe connection needed.
+        final fullJid = '${identity.jidLocalpart}@$_deviceIdentityVhost';
+        final result = await _registerDeviceIdentity(identity, fullJid);
+        if (!mounted) return;
+        if (result == null) {
+          _appendLog('[identity] resend of register-device failed or timed out — will retry next launch');
+        }
+        _connectWithDerivedIdentity(identity);
+        return;
+      }
+
+      // True steady state.
+      _connectWithDerivedIdentity(identity);
       return;
     }
-    await _provisionDeviceIdentity();
+
+    final legacy = await IdentityStore.loadLegacyCredentials();
+    if (legacy != null) {
+      await _migrateFromLegacy(legacy);
+      return;
+    }
+
+    if (await IdentityStore.wasEverProvisioned()) {
+      await _enterLostIdentityRecovery();
+      return;
+    }
+
+    await _provisionFirstIdentity();
   }
 
-  /// First-ever launch (or a previously-cleared identity): connect
-  /// anonymously just long enough to register a persistent per-device
-  /// ejabberd account, store its credentials, then reconnect for real using
-  /// them. Falls back to a plain anonymous connection (the pre-redesign
-  /// behavior) if registration fails for any reason - provisioning must
-  /// never be a hard blocker to using the app.
-  Future<void> _provisionDeviceIdentity() async {
-    DeviceIdInfo info;
-    try {
-      info = await getDeviceId();
-    } catch (e) {
-      _appendLog('[identity] could not determine deviceId, connecting anonymously: $e');
-      _connectGuest();
-      return;
-    }
+  /// Connects on an already-derived identity. If the account somehow
+  /// doesn't actually authenticate (removed server-side, or registration
+  /// never truly completed), retries registration once before finally
+  /// falling back to a plain anonymous connection — provisioning must never
+  /// be a hard blocker to using the app.
+  void _connectWithDerivedIdentity(DeviceIdentity identity) {
+    final fullJid = '${identity.jidLocalpart}@$_deviceIdentityVhost';
+    final xmpp = XmppClient(fullJid, identity.xmppPassword);
+    _startXmpp(xmpp);
+    // A successful connection here IS the confirmation that this identity
+    // actually works — no separate throwaway probe connection needed
+    // beforehand (removed; every extra connection a launch makes is one
+    // more attempt for a network-level rate limiter to count — see
+    // decision_log.md for a real lockout this caused). markProvisioned()
+    // is idempotent, so calling it on every successful connect via this
+    // helper (steady state included) is harmless.
+    final genericConnected = xmpp.onConnected;
+    xmpp.onConnected = (boundJid) {
+      unawaited(IdentityStore.markProvisioned());
+      genericConnected?.call(boundJid);
+    };
+    final generic = xmpp.onAuthFailed;
+    xmpp.onAuthFailed = () async {
+      _appendLog('[identity] derived credentials rejected — attempting one re-registration before falling back');
+      final result = await _registerDeviceIdentity(identity, fullJid);
+      if (result != null && mounted) {
+        _connectWithDerivedIdentity(identity);
+      } else {
+        generic?.call();
+      }
+    };
+  }
 
+  /// Connects anonymously just long enough to submit this device's already
+  /// -derived identity for registration, and awaits the server's ack.
+  /// Idempotent server-side (see server/deviceIdentity.js) — safe to call
+  /// again for an identity that's already registered. Returns the parsed
+  /// `device-registered` message, or null on failure/timeout.
+  Future<Map<String, dynamic>?> _registerDeviceIdentity(
+    DeviceIdentity identity,
+    String fullJid,
+  ) async {
     final bootstrap = XmppClient.guest();
     final registered = Completer<Map<String, dynamic>?>();
     bootstrap.onComponentMessage = (msg) {
@@ -326,7 +416,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       }
     };
     bootstrap.onConnected = (_) {
-      bootstrap.sendToComponent({'type': 'register-device', 'deviceId': info.deviceId});
+      bootstrap.sendToComponent({
+        'type': 'register-device',
+        'jid': fullJid,
+        'password': identity.xmppPassword,
+        'connectCode': identity.connectCode,
+      });
     };
     bootstrap.onAuthFailed = () {
       if (!registered.isCompleted) registered.complete(null);
@@ -338,26 +433,181 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       onTimeout: () => null,
     );
     bootstrap.disconnect();
+    return (result != null && result['type'] == 'device-registered') ? result : null;
+  }
+
+  /// Migration case 2: no MasterKey yet, but a legacy sha256(mac)-derived
+  /// identity is present.
+  ///
+  /// Every step below runs strictly sequentially — one XmppClient connects,
+  /// finishes, and fully disconnects before the next one opens. This
+  /// deliberately abandons the original "connect on the old identity
+  /// immediately, migrate in the background" design: two XmppClient/Whixp
+  /// connections open at once from this app is NOT safe — confirmed live,
+  /// running the legacy connection concurrently with a background
+  /// bootstrap connection produced garbled, spurious SCRAM-SHA-1/PLAIN
+  /// authentication failures on both, because the native transport's
+  /// SASL/stream state gets confused across simultaneous connections.
+  /// Every other flow in this codebase's history (the original
+  /// `_provisionDeviceIdentity`, the current `_registerDeviceIdentity`/
+  /// `_finishLegacyCleanup` helpers) already only ever holds one connection
+  /// open at a time — this just extends that same discipline here.
+  ///
+  /// Only 2 connections this launch (bootstrap register, then the real
+  /// connection) — not 4. Two simplifications on top of the sequential
+  /// fix, both because every extra connection a launch makes is one more
+  /// attempt for a network-level rate limiter to count (a real, self
+  /// -inflicted lockout was hit here live — see decision_log.md):
+  /// (1) no separate confirm-login probe — `_connectWithDerivedIdentity`'s
+  /// own success already proves the identity works, and it calls
+  /// `markProvisioned()` itself; (2) legacy-account cleanup is deferred
+  /// entirely to a *future* launch's case-3 path (`_connectPersistent`),
+  /// which is already correctly sequential and only runs once this new
+  /// identity has been used successfully at least once — arguably stronger
+  /// proof of it working than a disposable probe connection ever was.
+  Future<void> _migrateFromLegacy(({String jid, String password}) legacy) async {
+    String masterKey;
+    try {
+      masterKey = await generateMasterKey();
+      // Persisted BEFORE any network call — this is what makes the whole
+      // flow crash-safe. Once this write completes, re-entering this
+      // branch after any later crash is impossible; the next launch always
+      // resumes from the MasterKey-present cases above, which safely
+      // retry the same (idempotent) registration rather than generating a
+      // second, different MasterKey.
+      await IdentityStore.persistMasterKey(masterKey);
+    } catch (e) {
+      _appendLog('[identity] migration: failed to generate/persist a new MasterKey — using the legacy identity for now: $e');
+      _startXmpp(XmppClient(legacy.jid, legacy.password));
+      return;
+    }
+
+    DeviceIdentity identity;
+    try {
+      identity = await deriveIdentity(masterKeyHex: masterKey);
+    } catch (e) {
+      _appendLog('[identity] migration: failed to derive the new identity — using the legacy identity for now: $e');
+      _startXmpp(XmppClient(legacy.jid, legacy.password));
+      return;
+    }
+    if (mounted) setState(() => _permanentConnectCode = identity.connectCode);
+
+    final newJid = '${identity.jidLocalpart}@$_deviceIdentityVhost';
+    final registered = await _registerDeviceIdentity(identity, newJid);
+    if (!mounted) return;
+    if (registered == null) {
+      _appendLog('[identity] migration: register-device failed or timed out — using the legacy identity for now, will retry next launch');
+      _startXmpp(XmppClient(legacy.jid, legacy.password));
+      return;
+    }
+
+    _appendLog('[identity] migration: new identity $newJid registered — connecting on it now; legacy cleanup deferred to a later launch');
+    _connectWithDerivedIdentity(identity);
+  }
+
+  /// Migration case 3 (and the tail of case 2): retires the legacy account
+  /// by briefly reconnecting AS it — proving ownership the same way ejabberd
+  /// authenticates every other stanza in this codebase, so the server-side
+  /// handler needs no separate jid argument or ownership check (it always
+  /// unregisters whoever the connection is authenticated as). Idempotent:
+  /// a legacy account that's already gone (an earlier attempt succeeded but
+  /// this device crashed before clearing local storage) is treated as
+  /// success too, so this never gets stuck retrying forever.
+  Future<void> _finishLegacyCleanup(({String jid, String password}) legacy) async {
+    final probe = XmppClient(legacy.jid, legacy.password);
+    final done = Completer<bool>();
+    probe.onComponentMessage = (msg) {
+      if (msg['type'] == 'legacy-device-unregistered' ||
+          msg['type'] == 'legacy-device-unregister-failed') {
+        if (!done.isCompleted) done.complete(msg['type'] == 'legacy-device-unregistered');
+      }
+    };
+    probe.onConnected = (_) {
+      probe.sendToComponent({'type': 'unregister-legacy-device'});
+    };
+    probe.onAuthFailed = () {
+      // Can't even log in as the legacy identity anymore — most likely it's
+      // already gone. Treat the same as a confirmed unregister so local
+      // cleanup isn't stuck retrying forever.
+      if (!done.isCompleted) done.complete(true);
+    };
+    probe.connect();
+    final cleaned = await done.future.timeout(
+      const Duration(seconds: 15),
+      onTimeout: () => false,
+    );
+    probe.disconnect();
+    if (cleaned) {
+      await IdentityStore.clearLegacyCredentials();
+      _appendLog('[identity] legacy identity retired and cleared');
+    } else {
+      _appendLog('[identity] legacy cleanup did not complete — will retry next launch');
+    }
+  }
+
+  /// Genuine first launch: no MasterKey, no legacy credentials. Falls back
+  /// to a plain anonymous connection (unchanged pre-redesign behavior) if
+  /// provisioning fails for any reason — provisioning must never be a hard
+  /// blocker to using the app.
+  Future<void> _provisionFirstIdentity() async {
+    String masterKey;
+    try {
+      masterKey = await generateMasterKey();
+      await IdentityStore.persistMasterKey(masterKey);
+    } catch (e) {
+      _appendLog('[identity] could not generate/persist a MasterKey, connecting anonymously: $e');
+      _connectGuest();
+      return;
+    }
+
+    DeviceIdentity identity;
+    try {
+      identity = await deriveIdentity(masterKeyHex: masterKey);
+    } catch (e) {
+      _appendLog('[identity] could not derive an identity from a fresh MasterKey, connecting anonymously: $e');
+      _connectGuest();
+      return;
+    }
+    if (mounted) setState(() => _permanentConnectCode = identity.connectCode);
+
+    final fullJid = '${identity.jidLocalpart}@$_deviceIdentityVhost';
+    final result = await _registerDeviceIdentity(identity, fullJid);
     if (!mounted) return;
 
-    if (result != null && result['type'] == 'device-registered') {
-      final jid = result['jid'] as String;
-      final password = result['password'] as String;
-      try {
-        await _secureStorage.write(key: _deviceJidKey, value: jid);
-        await _secureStorage.write(key: _devicePasswordKey, value: password);
-      } catch (e) {
-        // Best-effort - if this device can't persist credentials it just
-        // re-provisions (a fresh account) on every future launch rather
-        // than failing to connect at all.
-        _appendLog('[identity] failed to persist device credentials: $e');
-      }
-      if (!mounted) return;
-      _startXmpp(XmppClient(jid, password));
-    } else {
+    if (result == null) {
       _appendLog('[identity] device registration failed or timed out — connecting anonymously');
       _connectGuest();
+      return;
     }
+
+    // The real connection below is itself the confirmation that this
+    // identity works, and calls markProvisioned() on success — no separate
+    // probe connection needed beforehand.
+    _connectWithDerivedIdentity(identity);
+  }
+
+  /// Migration case 4 / spec §7: the identity was lost (secure storage
+  /// wiped, deep-uninstalled, a different OS user account). Never silently
+  /// generate a replacement — surface the explicit recovery screen instead
+  /// and wait for the user to confirm before doing anything.
+  Future<void> _enterLostIdentityRecovery() async {
+    if (mounted) _setPhase(_Phase.identityRecovery, 'This device\'s identity could not be found');
+  }
+
+  /// The recovery screen's (or the connected app's "Reset identity" menu
+  /// item's) confirmed action: generate a brand-new MasterKey and connect
+  /// on it. This necessarily changes the JID, password, and connect code
+  /// together — there is no way to change just the code, since it's
+  /// deterministically derived from the same MasterKey (see Part D of the
+  /// plan this implements). If an old MasterKey/identity still exists
+  /// (a user-initiated reset, not a genuine recovery), it's simply
+  /// abandoned/orphaned — no cross-repo unregister call is made for it,
+  /// since unlike the sha256(mac) migration there is no reachable "legacy"
+  /// credential slot for a MasterKey-based identity to hand off from.
+  Future<void> _resetIdentity() async {
+    await IdentityStore.clearMasterKey();
+    if (mounted) setState(() => _permanentConnectCode = null);
+    await _provisionFirstIdentity();
   }
 
   void _startXmpp(XmppClient xmpp) {
@@ -400,7 +650,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'router-rtp-capabilities':
         await _signaling.loadDevice(msg['rtpCapabilities'] as Map<String, dynamic>);
         _appendLog('[mediasoup] device loaded from real router-rtp-capabilities');
-        if (_guestMode) {
+        if (_permanentConnectCode != null) {
+          // A persistent identity already has its permanent code — never
+          // request an ephemeral one for it (this was the original root
+          // cause of the code changing every reconnect, see decision.md).
+          _setPhase(_Phase.connected, 'Share your code with the agent to begin');
+        } else if (_guestMode) {
           _setPhase(_Phase.connected, 'Requesting your share code…');
           _xmpp?.sendToComponent({'type': 'guest-code-request'});
         } else {
@@ -645,7 +900,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
   /// Requests a replacement pairing code. The server invalidates any prior
   /// pending code for this JID, so this is always safe to call when idle.
+  /// A no-op for a persistent identity — its connect code is permanent, it
+  /// never needs refreshing (see decision.md).
   void _refreshGuestCode() {
+    if (_permanentConnectCode != null) return;
     if (!_guestMode || _xmpp == null || !_xmppConnected) return;
     if (mounted) setState(() => _guestCode = '');
     _xmpp!.sendToComponent({'type': 'guest-code-request'});
@@ -1113,7 +1371,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   }
 
   bool get _isConnected =>
-      _phase != _Phase.disconnected && _phase != _Phase.connecting && _phase != _Phase.error;
+      _phase != _Phase.disconnected &&
+      _phase != _Phase.connecting &&
+      _phase != _Phase.error &&
+      _phase != _Phase.identityRecovery;
 
   Color get _statusDotColor {
     if (_phase == _Phase.sharing && (_agentOnHold || _xmppReconnecting || _mediasoupRecovering)) {
@@ -1130,7 +1391,33 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case _Phase.sharing:
         return AppColors.live;
       case _Phase.error:
+      case _Phase.identityRecovery:
         return AppColors.danger;
+    }
+  }
+
+  /// Compact status word next to the dot in the AppBar — the detailed
+  /// message (_statusText) already appears in the preview area, this is
+  /// just the at-a-glance summary.
+  String get _connectionStatusLabel {
+    if (_phase == _Phase.sharing && (_agentOnHold || _xmppReconnecting || _mediasoupRecovering)) {
+      return 'Reconnecting…';
+    }
+    switch (_phase) {
+      case _Phase.disconnected:
+        return 'Not connected';
+      case _Phase.connecting:
+        return 'Connecting…';
+      case _Phase.sessionIncoming:
+        return 'Incoming request';
+      case _Phase.connected:
+      case _Phase.ready:
+      case _Phase.sharing:
+        return 'Connected';
+      case _Phase.error:
+        return 'Error';
+      case _Phase.identityRecovery:
+        return 'Action needed';
     }
   }
 
@@ -1145,19 +1432,15 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       appBar: AppBar(
         title: Row(
           children: [
-            Container(
-              width: 10,
-              height: 10,
-              decoration: BoxDecoration(color: _statusDotColor, shape: BoxShape.circle),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Image.asset('assets/images/oojack_logo.png', width: 30, height: 30),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: 12),
             // Always the static branded title, never the raw connected JID -
             // for a guest session that JID's domain is guest.ringopus, which
-            // has no reason to ever reach the customer's screen. The status
-            // dot to the left already communicates connection state.
-            const Expanded(
-              child: Text('Oojack Remote'),
-            ),
+            // has no reason to ever reach the customer's screen.
+            const Text('Oojack Remote', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 18)),
           ],
         ),
         actions: [
@@ -1173,6 +1456,21 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                 child: const Text('Disconnect'),
               ),
             ),
+          Padding(
+            padding: const EdgeInsets.only(right: 20),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(color: _statusDotColor, shape: BoxShape.circle),
+                ),
+                const SizedBox(width: 8),
+                Text(_connectionStatusLabel, style: TextStyle(color: AppColors.textSecondary, fontSize: 13)),
+              ],
+            ),
+          ),
         ],
       ),
       // Log panel lives outside the connected/sign-in split so it's visible
@@ -1190,8 +1488,54 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     );
   }
 
-  Widget _buildStartBody() =>
-      _showLegacyLogin ? _buildSignInBody() : _buildGuestStartBody();
+  Widget _buildStartBody() {
+    if (_phase == _Phase.identityRecovery) return _buildIdentityRecoveryBody();
+    return _showLegacyLogin ? _buildSignInBody() : _buildGuestStartBody();
+  }
+
+  /// Spec §7's explicit recovery state: this device's identity couldn't be
+  /// found. Never silently regenerate — require an explicit confirmation
+  /// first, since continuing creates a brand-new identity with no link to
+  /// whatever connect code anyone already had for this device.
+  Widget _buildIdentityRecoveryBody() {
+    return Center(
+      child: SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: Card(
+            margin: const EdgeInsets.all(24),
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('Identity not found', style: Theme.of(context).textTheme.titleLarge),
+                  const SizedBox(height: 12),
+                  Text(
+                    "This device's identity could not be found. This can happen after "
+                    'certain uninstall methods, a cleared credential store, or switching '
+                    'OS user accounts.\n\n'
+                    'Continuing will create a new identity — a new connect code will be '
+                    'issued, and anyone who had the previous code will need the new one.',
+                    style: TextStyle(color: AppColors.textSecondary),
+                  ),
+                  const SizedBox(height: 20),
+                  FilledButton(
+                    onPressed: () async {
+                      _setPhase(_Phase.connecting, 'Creating a new identity…');
+                      await _resetIdentity();
+                    },
+                    child: const Text('Create New Identity'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   /// Default entry screen: no credentials, just the guest session spinning
   /// up (it auto-starts on launch). Errors land here with a retry button;
@@ -1544,12 +1888,19 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _Phase.ready => 'Starting screen share…',
     _Phase.sharing => '',
     _Phase.error => _statusText,
+    _Phase.identityRecovery => _statusText,
   };
 
   String get _formattedGuestCode {
     final d = _guestCode;
     if (d.length != 9) return d;
     return '${d.substring(0, 3)}-${d.substring(3, 6)}-${d.substring(6)}';
+  }
+
+  String get _formattedPermanentCode {
+    final d = _permanentConnectCode ?? '';
+    if (d.length != 12) return d;
+    return '${d.substring(0, 4)} ${d.substring(4, 8)} ${d.substring(8)}';
   }
 
   /// What fills the preview box when there's no video: the share code while
@@ -1602,16 +1953,37 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     }
 
     if (_phase == _Phase.connected && _guestMode) {
+      // A persistent identity's permanent code takes priority over the
+      // ephemeral guest code — a device with one never requests the other
+      // (see the router-rtp-capabilities handler).
+      final displayCode = _permanentConnectCode ?? _guestCode;
+      final isPermanent = _permanentConnectCode != null;
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(
-              'Your share code',
-              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+            Container(
+              width: 96,
+              height: 96,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: AppColors.live.withValues(alpha: 0.08),
+                border: Border.all(color: AppColors.live.withValues(alpha: 0.35), width: 1.5),
+              ),
+              child: Icon(Icons.lock_rounded, color: AppColors.live, size: 36),
             ),
-            const SizedBox(height: 10),
-            if (_guestCode.isEmpty)
+            const SizedBox(height: 22),
+            Text(
+              isPermanent ? 'YOUR CONNECT CODE' : 'YOUR SHARE CODE',
+              style: TextStyle(
+                color: AppColors.live,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 2,
+              ),
+            ),
+            const SizedBox(height: 14),
+            if (displayCode.isEmpty)
               const SizedBox(
                 width: 22,
                 height: 22,
@@ -1622,25 +1994,43 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   SelectableText(
-                    _formattedGuestCode,
-                    style: appMonoStyle(fontSize: 34, fontWeight: FontWeight.w600),
+                    isPermanent ? _formattedPermanentCode : _formattedGuestCode,
+                    style: appMonoStyle(fontSize: 34, fontWeight: FontWeight.w700).copyWith(letterSpacing: 3),
                   ),
-                  const SizedBox(width: 8),
-                  IconButton(
-                    tooltip: 'Copy code',
-                    icon: const Icon(Icons.copy_rounded, size: 20),
-                    onPressed: () {
-                      Clipboard.setData(ClipboardData(text: _guestCode));
-                      _showTransientBanner('Code copied');
-                    },
+                  const SizedBox(width: 14),
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(kCornerRadius),
+                      border: Border.all(color: AppColors.live.withValues(alpha: 0.4)),
+                    ),
+                    child: IconButton(
+                      tooltip: 'Copy code',
+                      icon: Icon(Icons.copy_rounded, size: 20, color: AppColors.live),
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: displayCode));
+                        _showTransientBanner('Code copied');
+                      },
+                    ),
                   ),
                 ],
               ),
-            const SizedBox(height: 10),
-            Text(
-              'Read this code to your support agent to start a session.',
-              style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
-              textAlign: TextAlign.center,
+            const SizedBox(height: 20),
+            SizedBox(
+              width: 220,
+              child: Divider(color: AppColors.hairline),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.verified_user_rounded, color: AppColors.live, size: 16),
+                const SizedBox(width: 8),
+                Text(
+                  'Read this code to your support agent to start a session.',
+                  style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+                  textAlign: TextAlign.center,
+                ),
+              ],
             ),
           ],
         ),

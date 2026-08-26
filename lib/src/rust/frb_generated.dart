@@ -3,8 +3,8 @@
 
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
-import 'api/device_id.dart';
 import 'api/input_inject.dart';
+import 'api/persistent_identity.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'frb_generated.dart';
@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -1546257413;
+  int get rustContentHash => 644000415;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -79,7 +79,11 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 }
 
 abstract class RustLibApi extends BaseApi {
-  Future<DeviceIdInfo> crateApiDeviceIdGetDeviceId();
+  Future<DeviceIdentity> crateApiPersistentIdentityDeriveIdentity({
+    required String masterKeyHex,
+  });
+
+  Future<String> crateApiPersistentIdentityGenerateMasterKey();
 
   Future<void> crateApiInputInjectInitApp();
 
@@ -99,11 +103,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
-  Future<DeviceIdInfo> crateApiDeviceIdGetDeviceId() {
+  Future<DeviceIdentity> crateApiPersistentIdentityDeriveIdentity({
+    required String masterKeyHex,
+  }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(masterKeyHex, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -112,18 +119,48 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_device_id_info,
+          decodeSuccessData: sse_decode_device_identity,
           decodeErrorData: sse_decode_String,
         ),
-        constMeta: kCrateApiDeviceIdGetDeviceIdConstMeta,
+        constMeta: kCrateApiPersistentIdentityDeriveIdentityConstMeta,
+        argValues: [masterKeyHex],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiPersistentIdentityDeriveIdentityConstMeta =>
+      const TaskConstMeta(
+        debugName: "derive_identity",
+        argNames: ["masterKeyHex"],
+      );
+
+  @override
+  Future<String> crateApiPersistentIdentityGenerateMasterKey() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 2,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiPersistentIdentityGenerateMasterKeyConstMeta,
         argValues: [],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiDeviceIdGetDeviceIdConstMeta =>
-      const TaskConstMeta(debugName: "get_device_id", argNames: []);
+  TaskConstMeta get kCrateApiPersistentIdentityGenerateMasterKeyConstMeta =>
+      const TaskConstMeta(debugName: "generate_master_key", argNames: []);
 
   @override
   Future<void> crateApiInputInjectInitApp() {
@@ -134,7 +171,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 2,
+            funcId: 3,
             port: port_,
           );
         },
@@ -162,7 +199,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 4,
             port: port_,
           );
         },
@@ -189,7 +226,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 5,
             port: port_,
           );
         },
@@ -216,7 +253,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 6,
             port: port_,
           );
         },
@@ -241,14 +278,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  DeviceIdInfo dco_decode_device_id_info(dynamic raw) {
+  DeviceIdentity dco_decode_device_identity(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 2)
-      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
-    return DeviceIdInfo(
-      deviceId: dco_decode_String(arr[0]),
-      adapterKind: dco_decode_String(arr[1]),
+    if (arr.length != 3)
+      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    return DeviceIdentity(
+      jidLocalpart: dco_decode_String(arr[0]),
+      xmppPassword: dco_decode_String(arr[1]),
+      connectCode: dco_decode_String(arr[2]),
     );
   }
 
@@ -278,11 +316,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  DeviceIdInfo sse_decode_device_id_info(SseDeserializer deserializer) {
+  DeviceIdentity sse_decode_device_identity(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    var var_deviceId = sse_decode_String(deserializer);
-    var var_adapterKind = sse_decode_String(deserializer);
-    return DeviceIdInfo(deviceId: var_deviceId, adapterKind: var_adapterKind);
+    var var_jidLocalpart = sse_decode_String(deserializer);
+    var var_xmppPassword = sse_decode_String(deserializer);
+    var var_connectCode = sse_decode_String(deserializer);
+    return DeviceIdentity(
+      jidLocalpart: var_jidLocalpart,
+      xmppPassword: var_xmppPassword,
+      connectCode: var_connectCode,
+    );
   }
 
   @protected
@@ -322,10 +365,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  void sse_encode_device_id_info(DeviceIdInfo self, SseSerializer serializer) {
+  void sse_encode_device_identity(
+    DeviceIdentity self,
+    SseSerializer serializer,
+  ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_String(self.deviceId, serializer);
-    sse_encode_String(self.adapterKind, serializer);
+    sse_encode_String(self.jidLocalpart, serializer);
+    sse_encode_String(self.xmppPassword, serializer);
+    sse_encode_String(self.connectCode, serializer);
   }
 
   @protected
