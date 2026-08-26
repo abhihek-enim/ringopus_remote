@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:collection/collection.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 
 import 'mediasoup/mediasoup_client.dart';
 // The fork's ICE types live in handler_interface.dart, which the barrel
@@ -14,6 +16,27 @@ import 'src/rust/api/input_inject.dart';
 
 const Duration produceTimeout = Duration(seconds: 10);
 const Duration connectTimeout = Duration(seconds: 10);
+
+// SCTP label distinguishing clipboard DataProducers/Consumers from the
+// existing "remote-control" input channel — deliberately a SEPARATE
+// DataProducer/DataConsumer pair, not multiplexed onto the input channel's
+// JSON stream: consumeData()'s message handler below has no `type` switch
+// and blind-forwards every payload to injectInput(), which would silently
+// swallow a clipboard-shaped message as a no-op InputEvent rather than
+// erroring (verified against input_inject.rs's InputEvent, which has no
+// deny_unknown_fields).
+const String kClipboardDataLabel = 'oojack-clipboard-v1';
+
+// Matches the plan's application-level cap — see decision docs. Enforced
+// both sender-side (never send an oversized payload) and receiver-side
+// (defense-in-depth against a modified peer).
+const int kClipboardMaxPayloadBytes = 131072;
+
+String _generateClipboardTransferId() {
+  final rand = Random();
+  return '${DateTime.now().microsecondsSinceEpoch.toRadixString(16)}-'
+      '${rand.nextInt(0xFFFFFF).toRadixString(16)}';
+}
 
 // Debug-only: force ICE to use ONLY relay candidates, to prove the TURN path
 // in isolation. Build with `flutter run -d windows --dart-define=FORCE_TURN_RELAY=true`;
@@ -59,6 +82,24 @@ class MediasoupSignaling {
   void Function(Map<String, dynamic> msg)? sendToComponent;
 
   void Function(Map<String, dynamic> payload)? onDataMessage;
+
+  // Separate from _dataProducer/_dataConsumer above (see kClipboardDataLabel).
+  // _clipboardDataProducer: lazily created the first time this customer
+  // needs to SEND clipboard content (responding to a "Copy from Customer"
+  // request) — reused across repeated requests within the same session.
+  // _clipboardDataConsumer: (re)created per inbound "Paste to Customer".
+  DataProducer? _clipboardDataProducer;
+  DataConsumer? _clipboardDataConsumer;
+
+  Function? _pendingClipboardProduceDataCb;
+  Timer? _pendingClipboardProduceDataTimer;
+
+  /// Fired once an inbound "Paste to Customer" payload has been applied (or
+  /// failed to apply) to the local OS clipboard — drives a transient UI
+  /// banner in producer_home_page.dart. Separate from the XMPP
+  /// clipboard-applied/clipboard-apply-failed ack this class sends to the
+  /// agent, which happens regardless of whether this callback is set.
+  void Function({required bool success, String? reason})? onClipboardPasteResult;
 
   // ICE-derived connection state for whichever transport just changed -
   // label is 'send'/'recv', state is 'connecting'/'connected'/'failed'/
@@ -181,6 +222,34 @@ class MediasoupSignaling {
         'transportId': transport.id,
         'kind': kind,
         'rtpParameters': (data['rtpParameters'] as RtpParameters).toMap(),
+      });
+    });
+
+    // No existing listener for this today — the dead _pendingProduceDataCb/
+    // resolveProduceData() scaffolding above was never wired to a
+    // 'producedata' handler, so produceData() would have thrown ("no
+    // producedata listener set") had anything ever called it. Clipboard is
+    // the first real caller; this listener is specifically for the
+    // clipboard producer (see produceClipboardData() below).
+    transport.on('producedata', (data) {
+      // ignore: avoid_print
+      print('[MediasoupSignaling] producedata event fired (clipboard)');
+      final callback = data['callback'] as Function;
+      final errback = data['errback'] as Function;
+      _pendingClipboardProduceDataCb = callback;
+      _pendingClipboardProduceDataTimer = Timer(produceTimeout, () {
+        _pendingClipboardProduceDataCb = null;
+        _pendingClipboardProduceDataTimer = null;
+        errback(StateError('clipboard-produce-data: server ack timeout'));
+      });
+      final sctp = data['sctpStreamParameters'] as SctpStreamParameters;
+      sendToComponent?.call({
+        'type': 'clipboard-produce-data',
+        'sid': sid,
+        'sctpStreamParameters': sctp.toMap(),
+        'label': data['label'],
+        'protocol': data['protocol'],
+        'contentType': 'text/plain',
       });
     });
   }
@@ -526,6 +595,195 @@ class MediasoupSignaling {
     await consumeData(params);
   }
 
+  /// "Copy from Customer": lazily creates this customer's clipboard
+  /// DataProducer on the send transport — idempotent, a no-op once already
+  /// created and still open this session, since the same producer is reused
+  /// across repeated copy requests from any agent.
+  Future<void> produceClipboardData() async {
+    if (_clipboardDataProducer != null && !_clipboardDataProducer!.closed) {
+      return;
+    }
+    final transport = _sendTransport;
+    if (transport == null) {
+      throw StateError('[MediasoupSignaling] send transport not created');
+    }
+    await transport.handlerReady;
+
+    final completer = Completer<void>();
+    transport.dataProducerCallback = (dataProducer) {
+      _clipboardDataProducer = dataProducer as DataProducer;
+      // ignore: avoid_print
+      print('[MediasoupSignaling] clipboard dataProducer created: ${_clipboardDataProducer!.id}');
+      if (!completer.isCompleted) completer.complete();
+    };
+    // ordered:true + a generous maxRetransmits is the closest this vendored
+    // fork's produceData() can express to "fully reliable" - its public
+    // signature requires a concrete int (transport.dart's `required int
+    // maxRetransmits`), unlike the real mediasoup-client (JS/TS) used on the
+    // agent side, where these fields are genuinely optional and omitting
+    // them yields a true W3C-reliable channel. A capped, one-shot text
+    // payload on an already-connected session should comfortably succeed
+    // well within this retry budget.
+    transport.produceData(
+      ordered: true,
+      maxRetransmits: 30,
+      label: kClipboardDataLabel,
+    );
+    await completer.future.timeout(
+      produceTimeout,
+      onTimeout: () =>
+          throw StateError('produce-data (clipboard): local ack timeout'),
+    );
+  }
+
+  /// Sends `text` over this customer's already-open clipboard producer.
+  /// Generates and returns the envelope's transferId (useful for logging) —
+  /// the caller does not construct one itself. Caller must have already
+  /// awaited produceClipboardData() and validated the payload against
+  /// kClipboardMaxPayloadBytes; this only guards against a producer that
+  /// isn't actually open, it does not re-validate size.
+  String sendClipboardData(String text) {
+    final transferId = _generateClipboardTransferId();
+    final producer = _clipboardDataProducer;
+    if (producer == null || producer.closed) {
+      // ignore: avoid_print
+      print('[MediasoupSignaling] sendClipboardData: no open clipboard producer, dropping');
+      return transferId;
+    }
+    producer.send(jsonEncode({
+      'type': 'clipboard-data',
+      'version': 1,
+      'transferId': transferId,
+      'direction': 'customer-to-agent',
+      'contentType': 'text/plain',
+      'encoding': 'utf8',
+      'payload': text,
+      'size': utf8.encode(text).length,
+      'sourceTimestamp': DateTime.now().millisecondsSinceEpoch,
+    }));
+    return transferId;
+  }
+
+  /// "Paste to Customer": starts consuming an inbound clipboard DataChannel.
+  /// A fully separate DataConsumer from _dataConsumer (input) — see
+  /// kClipboardDataLabel — with its own message handler that writes to the
+  /// OS clipboard instead of injecting input, and sends the delivery ack
+  /// (clipboard-applied/clipboard-apply-failed) back over XMPP itself rather
+  /// than delegating that decision to producer_home_page.dart.
+  Future<void> consumeClipboardData(Map<String, dynamic> params) async {
+    final transport = _recvTransport;
+    if (transport == null) {
+      throw StateError('[MediasoupSignaling] recv transport not created');
+    }
+    await transport.handlerReady;
+
+    _clipboardDataConsumer?.close();
+    _clipboardDataConsumer = null;
+
+    final completer = Completer<void>();
+    // Shares Transport.dataConsumerCallback with consumeData() (input) above
+    // — a single field on the vendored library's Transport, not a
+    // multi-listener event. Safe here because every caller of either
+    // consumeData-family method awaits its own completer before returning,
+    // so in normal operation there is no window where a second call
+    // reassigns this field before the first call's queued task has already
+    // read and invoked it (see Transport.consumeData()'s _flexQueue).
+    transport.dataConsumerCallback = (dataConsumer, [accept]) {
+      _clipboardDataConsumer = dataConsumer as DataConsumer;
+      // ignore: avoid_print
+      print('[MediasoupSignaling] clipboard dataConsumer created: ${_clipboardDataConsumer!.id}');
+      _clipboardDataConsumer!.on('message', (event) {
+        final message = (event as Map)['data'] as RTCDataChannelMessage;
+        unawaited(_handleClipboardMessage(message));
+      });
+      if (!completer.isCompleted) completer.complete();
+    };
+    final sctpJson = params['sctpStreamParameters'] as Map<String, dynamic>;
+    transport.consumeData(
+      id: params['dataConsumerId'] as String,
+      dataProducerId: params['dataProducerId'] as String,
+      sctpStreamParameters: SctpStreamParameters(
+        streamId: sctpJson['streamId'] as int,
+        ordered: sctpJson['ordered'] as bool?,
+        maxPacketLifeTime: sctpJson['maxPacketLifeTime'] as int?,
+        maxRetransmits: sctpJson['maxRetransmits'] as int?,
+      ),
+      label: (params['label'] as String?) ?? kClipboardDataLabel,
+      protocol: (params['protocol'] as String?) ?? '',
+    );
+    await completer.future;
+  }
+
+  Future<void> _handleClipboardMessage(RTCDataChannelMessage message) async {
+    if (message.isBinary) return; // clipboard channel is text-only, matches the input channel's convention
+
+    Map<String, dynamic> envelope;
+    try {
+      envelope = jsonDecode(message.text) as Map<String, dynamic>;
+    } catch (_) {
+      await _sendClipboardApplyFailed(null, 'malformed');
+      return;
+    }
+
+    final transferId = envelope['transferId'] as String?;
+    final contentType = envelope['contentType'] as String?;
+    final payload = envelope['payload'] as String?;
+
+    if (contentType != 'text/plain' || payload == null) {
+      await _sendClipboardApplyFailed(transferId, 'unsupported-content-type');
+      return;
+    }
+    if (utf8.encode(payload).length > kClipboardMaxPayloadBytes) {
+      await _sendClipboardApplyFailed(transferId, 'oversized-payload');
+      return;
+    }
+
+    try {
+      // Flutter's own cross-platform clipboard API (already used elsewhere
+      // in this app for the connect-code copy button) — no native Rust
+      // needed for plain text get/set.
+      await Clipboard.setData(ClipboardData(text: payload));
+    } catch (e) {
+      // ignore: avoid_print
+      print('[MediasoupSignaling] Clipboard.setData failed: $e');
+      await _sendClipboardApplyFailed(transferId, 'write-failed');
+      return;
+    }
+
+    sendToComponent?.call({
+      'type': 'clipboard-applied',
+      'sid': sid,
+      'transferId': transferId,
+      'contentType': contentType,
+      'size': utf8.encode(payload).length,
+    });
+    onClipboardPasteResult?.call(success: true);
+    // ignore: avoid_print
+    print('[MediasoupSignaling] clipboard paste applied (transferId=$transferId)');
+  }
+
+  Future<void> _sendClipboardApplyFailed(String? transferId, String reason) async {
+    sendToComponent?.call({
+      'type': 'clipboard-apply-failed',
+      'sid': sid,
+      if (transferId != null) 'transferId': transferId,
+      'reason': reason,
+    });
+    onClipboardPasteResult?.call(success: false, reason: reason);
+    // ignore: avoid_print
+    print('[MediasoupSignaling] clipboard paste failed: $reason (transferId=$transferId)');
+  }
+
+  void resolveClipboardProduceData(String dataProducerId) {
+    _pendingClipboardProduceDataTimer?.cancel();
+    _pendingClipboardProduceDataTimer = null;
+    final cb = _pendingClipboardProduceDataCb;
+    if (cb != null) {
+      cb(dataProducerId);
+      _pendingClipboardProduceDataCb = null;
+    }
+  }
+
   /// Local bandwidth/CPU optimization for hold: stops the encoder from
   /// consuming CPU while nobody is watching. Not required for correctness -
   /// the server's own producer.pause()/consumer.pause() are what actually
@@ -584,6 +842,7 @@ class MediasoupSignaling {
   Future<void> cleanup() async {
     _pendingProduceTimer?.cancel();
     _pendingProduceDataTimer?.cancel();
+    _pendingClipboardProduceDataTimer?.cancel();
     _senderStatsTimer?.cancel();
     _senderStatsTimer = null;
     _prevSenderBytesSent = null;
@@ -596,6 +855,8 @@ class MediasoupSignaling {
     _pendingProduceTimer = null;
     _pendingProduceDataCb = null;
     _pendingProduceDataTimer = null;
+    _pendingClipboardProduceDataCb = null;
+    _pendingClipboardProduceDataTimer = null;
     _lastMoveSeq = -1;
 
     // Producer/DataProducer/DataConsumer.close() are synchronous (void);
@@ -606,11 +867,15 @@ class MediasoupSignaling {
     _producer?.close();
     _dataProducer?.close();
     _dataConsumer?.close();
+    _clipboardDataProducer?.close();
+    _clipboardDataConsumer?.close();
     await _sendTransport?.close();
     await _recvTransport?.close();
     _producer = null;
     _dataProducer = null;
     _dataConsumer = null;
+    _clipboardDataProducer = null;
+    _clipboardDataConsumer = null;
     _sendTransport = null;
     _recvTransport = null;
     sid = '';

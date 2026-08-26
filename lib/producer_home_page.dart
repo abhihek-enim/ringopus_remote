@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
@@ -182,6 +183,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     super.initState();
     _renderer.initialize();
     _signaling.onTransportStateChanged = _onMediasoupStateChanged;
+    _signaling.onClipboardPasteResult = _onClipboardPasteResult;
     // Auto-connect on launch, via the persistent device identity, so the
     // customer sees their pairing code without any sign-in step. Permissions
     // are requested first, on this same first frame, so Accessibility/Screen
@@ -251,6 +253,16 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _transientBannerTimer = Timer(const Duration(seconds: 3), () {
       if (mounted) setState(() => _transientBanner = null);
     });
+  }
+
+  // Fired by MediasoupSignaling once an inbound "Paste to Customer" payload
+  // has been applied (or failed to apply) to the local OS clipboard. The
+  // XMPP ack to the agent is sent by _signaling itself, independent of this
+  // — this is purely local UI feedback.
+  void _onClipboardPasteResult({required bool success, String? reason}) {
+    _showTransientBanner(
+      success ? 'Received clipboard from agent' : 'Clipboard from agent failed${reason != null ? ' ($reason)' : ''}',
+    );
   }
 
   // Every print() call in the app - ours, whixp's internal traces,
@@ -808,6 +820,37 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
           _appendLog('startInputInjection (resume) failed: $e');
         }
         _setHold(false, 'Sharing "$_sourceName"');
+
+      // Cross-clipboard, both directions. All five message types are
+      // signaling-channel (XMPP), not the clipboard DataChannel itself —
+      // that channel's actual payload is handled entirely inside
+      // MediasoupSignaling (consumeClipboardData/_handleClipboardMessage).
+      case 'clipboard-copy-request':
+        await _handleClipboardCopyRequest(msg);
+
+      case 'clipboard-data-consumer-params':
+        _appendLog('[clipboard] data-consumer-params received — wiring paste-to-customer');
+        await _signaling.consumeClipboardData(msg);
+
+      case 'clipboard-data-producer-created':
+        _signaling.resolveClipboardProduceData(msg['dataProducerId'] as String);
+
+      case 'clipboard-applied':
+        _appendLog('[clipboard] agent applied the clipboard content we sent');
+        _showTransientBanner('Clipboard shared with agent');
+
+      case 'clipboard-apply-failed':
+        _appendLog('[clipboard] agent failed to apply our clipboard content: ${msg['reason']}');
+        _showTransientBanner('Agent could not use the clipboard');
+
+      // Generic rejection of our own clipboard-produce-data (e.g. a
+      // session-state race) — distinct from clipboard-copy-unavailable
+      // (which _handleClipboardCopyRequest sends itself, before ever
+      // calling produceClipboardData). Without this case the pending
+      // produceClipboardData() call would just run out its own
+      // produceTimeout instead of failing promptly.
+      case 'clipboard-error':
+        _appendLog('[clipboard] rejected: ${msg['reason']}');
 
       // Agent-side tab-backgrounding (multi-session) — deliberately NOT
       // session-held/session-resumed. Unlike genuine hold above, this must
@@ -1368,6 +1411,73 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     if (!_mediasoupNeedingRecovery.contains(label)) return; // already reconnected
     _signaling.restartIce(label, msg['iceParameters'] as Map<String, dynamic>);
     _appendLog('[recovery] applied restart-ice for $label — awaiting reconnect');
+  }
+
+  /// Customer-side half of "Copy from Customer": read our own OS clipboard
+  /// and, on success, produce+send it to whichever agent asked. Gated the
+  /// same way hold already gates input injection — a held or stale session
+  /// must not let a backgrounded/superseded agent pull clipboard content.
+  Future<void> _handleClipboardCopyRequest(Map<String, dynamic> msg) async {
+    final sid = msg['sid'] as String?;
+    if (_phase != _Phase.sharing || _agentOnHold || sid != _signaling.sid) {
+      _xmpp?.sendToComponent({
+        'type': 'clipboard-copy-unavailable',
+        'sid': sid,
+        'reason': 'session-not-active',
+      });
+      return;
+    }
+
+    ClipboardData? data;
+    try {
+      // Flutter's own cross-platform clipboard API (already used elsewhere
+      // in this app for the connect-code copy button) — no native Rust
+      // needed for plain text get/set. A null return means "nothing text
+      // there," not an error — distinct from a thrown PlatformException.
+      data = await Clipboard.getData(Clipboard.kTextPlain);
+    } catch (e) {
+      _appendLog('[clipboard] read failed: $e');
+      _xmpp?.sendToComponent({
+        'type': 'clipboard-copy-unavailable',
+        'sid': sid,
+        'reason': 'read-failed',
+      });
+      return;
+    }
+
+    final text = data?.text;
+    if (text == null || text.isEmpty) {
+      _xmpp?.sendToComponent({
+        'type': 'clipboard-copy-unavailable',
+        'sid': sid,
+        'reason': 'empty',
+      });
+      return;
+    }
+
+    if (utf8.encode(text).length > kClipboardMaxPayloadBytes) {
+      _xmpp?.sendToComponent({
+        'type': 'clipboard-copy-unavailable',
+        'sid': sid,
+        'reason': 'oversized-payload',
+      });
+      return;
+    }
+
+    try {
+      await _signaling.produceClipboardData();
+    } catch (e) {
+      _appendLog('[clipboard] produce failed: $e');
+      _xmpp?.sendToComponent({
+        'type': 'clipboard-copy-unavailable',
+        'sid': sid,
+        'reason': 'clipboard-unavailable',
+      });
+      return;
+    }
+
+    final transferId = _signaling.sendClipboardData(text);
+    _appendLog('[clipboard] sent our clipboard content (transferId=$transferId)');
   }
 
   bool get _isConnected =>
