@@ -1,9 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show File;
+import 'dart:typed_data' show Uint8List;
 
 import 'package:collection/collection.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:whixp/whixp.dart' show TransportState;
 import 'package:window_manager/window_manager.dart';
@@ -55,6 +59,77 @@ class _ChatEntry {
   final String from;
   final String body;
 }
+
+// File transfer (Agent<->Customer) status — mirrors the agent's
+// ActiveFileTransfer (useRemoteSession.ts). No queue: this app tracks at
+// most one transfer at a time, same one-at-a-time model as the agent side
+// and as server/fileTransfer.js's own client-facing contract.
+enum _FileTransferRole { sender, receiver }
+
+enum _FileTransferStatus {
+  offering, // sender: file-offer sent, awaiting accept/decline
+  incoming, // receiver: file-offer received, awaiting our accept/decline
+  awaitingUpload, // receiver: accepted, waiting for sender's PUT to finish
+  uploading, // sender: PUT in progress
+  uploaded, // sender: PUT finished, waiting for recipient's GET
+  downloading, // receiver: GET in progress
+  complete,
+  declined,
+  cancelled,
+  failed,
+}
+
+class _ActiveFileTransfer {
+  _ActiveFileTransfer({
+    required this.transferId,
+    required this.fileName,
+    required this.fileSize,
+    required this.direction,
+    required this.role,
+    required this.status,
+    this.progress = 0,
+  });
+
+  // Null only while this side is the sender and hasn't yet learned the
+  // transferId the server assigned (it's handed only to the recipient in
+  // file-offer) — resolved lazily from whichever response arrives first for
+  // this app's one pending offer. See mirror comment in useRemoteSession.ts.
+  String? transferId;
+  final String fileName;
+  final int fileSize;
+  final String direction; // 'agent-to-customer' | 'customer-to-agent'
+  final _FileTransferRole role;
+  _FileTransferStatus status;
+  double progress; // 0-100, meaningful only during uploading/downloading
+
+  _ActiveFileTransfer copyWith({String? transferId, _FileTransferStatus? status, double? progress}) {
+    return _ActiveFileTransfer(
+      transferId: transferId ?? this.transferId,
+      fileName: fileName,
+      fileSize: fileSize,
+      direction: direction,
+      role: role,
+      status: status ?? this.status,
+      progress: progress ?? this.progress,
+    );
+  }
+}
+
+const int kFileTransferMaxBytes = 25 * 1024 * 1024; // 25 MB, both directions
+
+const Map<String, String> kFileTransferErrorMessages = {
+  'session-not-active': 'Session isn\'t active right now.',
+  'not-authorized': 'Only the controlling agent can transfer files.',
+  'malformed': 'File transfer failed (malformed message).',
+  'oversized-payload': 'File is larger than the 25 MB limit.',
+  'cancelled': 'File transfer was cancelled.',
+  'hold': 'File transfer was cancelled — session is on hold.',
+  'controller-changed': 'File transfer was cancelled — control changed hands.',
+  'session-ended': 'File transfer was cancelled — session ended.',
+  'timeout': 'File transfer expired.',
+  'read-failed': 'Couldn\'t read the file.',
+  'write-failed': 'Couldn\'t write the file.',
+};
 
 // Why a drop is being torn down - purely for status text / notifyPeer choice,
 // not a new _Phase value (see DECISIONS.md-style reasoning in the plan this
@@ -154,6 +229,22 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   // though the agent was ready the whole time — reproduced live as "first
   // copy in a session works, a later one hangs the full 10s".
   bool _clipboardConsumerReadyReceived = false;
+
+  // File transfer (Agent<->Customer). One at a time, no queue — see
+  // _ActiveFileTransfer's doc comment. _fileTransferClient is whichever
+  // http.Client is currently mid-upload/download, if any; closing it is how
+  // _cancelFileTransfer/teardown abort an in-flight request.
+  _ActiveFileTransfer? _activeFileTransfer;
+  String _fileTransferError = '';
+  http.Client? _fileTransferClient;
+  // Auto-clears a finished (complete/declined/cancelled/failed) transfer so
+  // the next Send File isn't blocked behind a stale terminal card the user
+  // never manually dismissed — see _scheduleFileTransferAutoClear().
+  Timer? _fileTransferAutoClearTimer;
+  // Local path picked via FilePicker for an outgoing send — held here (not
+  // on _ActiveFileTransfer, which mirrors only server-tracked fields) until
+  // the upload actually starts, since it's never sent over the wire.
+  String? _pendingSendFilePath;
 
   // Dock-to-corner (replaces the earlier minimize-on-share behavior): the
   // window's size/position from just before docking, restored verbatim on
@@ -816,6 +907,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
       case 'session-held':
         _appendLog('--- session held (sid=${msg['sid']}) ---');
+        // Mirrors fileTransfer.js's own killTransfersForSession(sid, 'hold')
+        // call — a file-failed for this side's transfer (if any) will also
+        // arrive from the server, but don't wait on it to unstick the UI.
+        _resetFileTransfer();
         _signaling.pauseSending();
         // Defence-in-depth: disarm input injection while held so a backgrounded
         // agent tab can never inject into this customer, independent of the
@@ -885,6 +980,47 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'clipboard-error':
         _appendLog('[clipboard] rejected: ${msg['reason']}');
 
+      // File transfer (Agent<->Customer). Bytes never touch this channel —
+      // these five are the only server-generated pushes for this feature;
+      // file-offer/file-accepted/file-declined/file-transfer-cancel are the
+      // only client-originated ones (sent from the methods below, never
+      // handled here since this app never receives its own sends back).
+      case 'file-offer':
+        _handleIncomingFileOffer(msg);
+
+      case 'file-ready':
+        _handleFileReady(msg);
+
+      case 'file-declined':
+        if (_activeFileTransfer != null &&
+            (_activeFileTransfer!.transferId == msg['transferId'] || _activeFileTransfer!.transferId == null)) {
+          setState(() => _activeFileTransfer!.status = _FileTransferStatus.declined);
+          _scheduleFileTransferAutoClear();
+        }
+
+      case 'file-complete':
+        if (_activeFileTransfer?.role == _FileTransferRole.sender &&
+            _activeFileTransfer!.transferId == msg['transferId']) {
+          setState(() {
+            _activeFileTransfer!.status = _FileTransferStatus.complete;
+            _activeFileTransfer!.progress = 100;
+          });
+          _scheduleFileTransferAutoClear();
+        }
+
+      case 'file-failed':
+        final active = _activeFileTransfer;
+        if (active != null &&
+            (msg['transferId'] == null || active.transferId == msg['transferId'] || active.transferId == null)) {
+          _fileTransferClient?.close();
+          _fileTransferClient = null;
+          setState(() {
+            active.status = _FileTransferStatus.failed;
+            _fileTransferError = kFileTransferErrorMessages[msg['reason']] ?? 'File transfer failed.';
+          });
+          _scheduleFileTransferAutoClear();
+        }
+
       // Agent-side tab-backgrounding (multi-session) — deliberately NOT
       // session-held/session-resumed. Unlike genuine hold above, this must
       // NEVER touch _signaling.pauseSending()/resumeSending(): the agent
@@ -913,6 +1049,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
       case 'session-agent-changed':
         _appendLog('--- new agent attached (sid=${msg['sid']}) ---');
+        // Same controller-change rule as fileTransfer.js's
+        // killTransfersForController — the outgoing agent's own transfer (if
+        // this side was mid-upload/download with them) is moot now.
+        _resetFileTransfer();
         _showTransientBanner('Agent connected');
 
       case 'session-error':
@@ -1272,6 +1412,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _agentOnHold = false;
     _pendingClipboardConsumerReady = null;
     _clipboardConsumerReadyReceived = false;
+    _resetFileTransfer();
     _xmppReconnecting = false;
     _mediasoupRecovering = false;
     _consentTimer?.cancel();
@@ -1563,6 +1704,262 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
     final transferId = _signaling.sendClipboardData(text);
     _appendLog('[clipboard] sent our clipboard content (transferId=$transferId)');
+  }
+
+  // ── File transfer (Agent<->Customer) ──────────────────────────────────
+  // Explicit-action-only, same as the "Send File" button on the agent side —
+  // no keystroke trigger. Bytes travel over HTTPS PUT/GET to the
+  // orchestrator (server/fileTransfer.js), never through XMPP/mediasoup.
+
+  void _resetFileTransfer() {
+    _fileTransferAutoClearTimer?.cancel();
+    _fileTransferAutoClearTimer = null;
+    _fileTransferClient?.close();
+    _fileTransferClient = null;
+    _pendingSendFilePath = null;
+    if (!mounted) return;
+    setState(() {
+      _activeFileTransfer = null;
+      _fileTransferError = '';
+    });
+  }
+
+  // Call right after setting a transfer to a terminal status
+  // (complete/declined/cancelled/failed) — clears it on its own a few
+  // seconds later so the user doesn't have to manually dismiss the card
+  // before Send File works again.
+  void _scheduleFileTransferAutoClear() {
+    _fileTransferAutoClearTimer?.cancel();
+    _fileTransferAutoClearTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) _resetFileTransfer();
+    });
+  }
+
+  void _handleIncomingFileOffer(Map<String, dynamic> msg) {
+    if (_activeFileTransfer != null) {
+      // No local queue — a second concurrent offer is auto-declined so the
+      // sender isn't left hanging, mirroring the agent side's same guard.
+      _xmpp?.sendToComponent({'type': 'file-declined', 'sid': _signaling.sid, 'transferId': msg['transferId']});
+      return;
+    }
+    setState(() {
+      _fileTransferError = '';
+      _activeFileTransfer = _ActiveFileTransfer(
+        transferId: msg['transferId'] as String,
+        fileName: (msg['fileName'] as String?) ?? 'file',
+        fileSize: (msg['fileSize'] as num?)?.toInt() ?? 0,
+        direction: (msg['direction'] as String?) ?? 'agent-to-customer',
+        role: _FileTransferRole.receiver,
+        status: _FileTransferStatus.incoming,
+      );
+    });
+  }
+
+  // Two variants distinguished by which field is present — see
+  // _ActiveFileTransfer's doc comment for why the sender's transferId is
+  // adopted lazily from whichever response arrives first.
+  void _handleFileReady(Map<String, dynamic> msg) {
+    final active = _activeFileTransfer;
+    if (active == null) return;
+    final uploadUrl = msg['uploadUrl'] as String?;
+    final downloadUrl = msg['downloadUrl'] as String?;
+    if (uploadUrl != null) {
+      if (active.transferId != null && active.transferId != msg['transferId']) return;
+      final resolvedId = active.transferId ?? msg['transferId'] as String;
+      setState(() {
+        active.transferId = resolvedId;
+        active.status = _FileTransferStatus.uploading;
+        active.progress = 0;
+      });
+      unawaited(_startFileUpload(uploadUrl, resolvedId));
+    } else if (downloadUrl != null && active.transferId == msg['transferId']) {
+      setState(() {
+        active.status = _FileTransferStatus.downloading;
+        active.progress = 0;
+      });
+      unawaited(_startFileDownload(downloadUrl, msg['transferId'] as String, (msg['fileName'] as String?) ?? active.fileName));
+    }
+  }
+
+  // "Send File" — the only trigger for this direction, no keystroke
+  // equivalent.
+  Future<void> _sendFile() async {
+    if (_phase != _Phase.sharing || _agentOnHold || _activeFileTransfer != null) return;
+
+    final result = await FilePicker.platform.pickFiles();
+    final picked = result?.files.singleOrNull;
+    if (picked?.path == null) return; // cancelled
+
+    final path = picked!.path!;
+    final fileSize = picked.size;
+    if (fileSize > kFileTransferMaxBytes) {
+      setState(() => _fileTransferError = kFileTransferErrorMessages['oversized-payload']!);
+      return;
+    }
+
+    _pendingSendFilePath = path;
+    setState(() {
+      _fileTransferError = '';
+      _activeFileTransfer = _ActiveFileTransfer(
+        transferId: null,
+        fileName: picked.name,
+        fileSize: fileSize,
+        direction: 'customer-to-agent',
+        role: _FileTransferRole.sender,
+        status: _FileTransferStatus.offering,
+      );
+    });
+    _xmpp?.sendToComponent({
+      'type': 'file-offer',
+      'sid': _signaling.sid,
+      'fileName': picked.name,
+      'fileSize': fileSize,
+      'direction': 'customer-to-agent',
+    });
+  }
+
+  void _acceptIncomingFile() {
+    final active = _activeFileTransfer;
+    if (active == null || active.role != _FileTransferRole.receiver || active.status != _FileTransferStatus.incoming) {
+      return;
+    }
+    _xmpp?.sendToComponent({'type': 'file-accepted', 'sid': _signaling.sid, 'transferId': active.transferId});
+    setState(() => active.status = _FileTransferStatus.awaitingUpload);
+  }
+
+  void _declineIncomingFile() {
+    final active = _activeFileTransfer;
+    if (active == null || active.role != _FileTransferRole.receiver || active.status != _FileTransferStatus.incoming) {
+      return;
+    }
+    _xmpp?.sendToComponent({'type': 'file-declined', 'sid': _signaling.sid, 'transferId': active.transferId});
+    _resetFileTransfer();
+  }
+
+  void _cancelFileTransfer() {
+    final active = _activeFileTransfer;
+    if (active == null) return;
+    if (active.transferId != null) {
+      _xmpp?.sendToComponent({
+        'type': 'file-transfer-cancel', 'sid': _signaling.sid, 'transferId': active.transferId,
+      });
+    }
+    _resetFileTransfer();
+  }
+
+  // Reads the picked file's bytes and PUTs them, tracking progress via a
+  // StreamedRequest so the actual send can be awaited concurrently with
+  // writing chunks into its sink — plain http gives real upload progress
+  // this way, no need for dio (see decision.md "File Transfer V1"). Bytes
+  // are held in memory only; the 25MB cap makes that trivial.
+  Future<void> _startFileUpload(String uploadUrl, String transferId) async {
+    final path = _pendingSendFilePath;
+    if (path == null) return;
+    final client = http.Client();
+    _fileTransferClient = client;
+    try {
+      final bytes = await File(path).readAsBytes();
+      final request = http.StreamedRequest('PUT', Uri.parse(uploadUrl));
+      request.contentLength = bytes.length;
+      final sendFuture = client.send(request);
+
+      const chunkSize = 65536;
+      var offset = 0;
+      while (offset < bytes.length) {
+        final end = (offset + chunkSize < bytes.length) ? offset + chunkSize : bytes.length;
+        request.sink.add(bytes.sublist(offset, end));
+        offset = end;
+        if (mounted && _activeFileTransfer?.transferId == transferId) {
+          setState(() => _activeFileTransfer!.progress = offset / bytes.length * 100);
+        }
+        await Future<void>.delayed(Duration.zero);
+      }
+      await request.sink.close();
+
+      final response = await sendFuture;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw StateError('upload failed: HTTP ${response.statusCode}');
+      }
+      _fileTransferClient = null;
+      if (mounted && _activeFileTransfer?.transferId == transferId) {
+        setState(() {
+          _activeFileTransfer!.status = _FileTransferStatus.uploaded;
+          _activeFileTransfer!.progress = 100;
+        });
+      }
+    } catch (e) {
+      _fileTransferClient = null;
+      _appendLog('[file-transfer] upload failed: $e');
+      if (mounted && _activeFileTransfer?.transferId == transferId) {
+        setState(() {
+          _activeFileTransfer!.status = _FileTransferStatus.failed;
+          _fileTransferError = '$e';
+        });
+        _scheduleFileTransferAutoClear();
+      }
+    } finally {
+      client.close();
+    }
+  }
+
+  // GETs the bytes, then prompts Save As. The download completing is already
+  // enough for the server to consider the transfer done (see
+  // fileTransfer.js's res.on('finish')) — cancelling the Save dialog only
+  // discards the already-downloaded bytes locally.
+  Future<void> _startFileDownload(String downloadUrl, String transferId, String fileName) async {
+    final client = http.Client();
+    _fileTransferClient = client;
+    try {
+      final response = await client.send(http.Request('GET', Uri.parse(downloadUrl)));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw StateError('download failed: HTTP ${response.statusCode}');
+      }
+      final total = response.contentLength ?? 0;
+      var received = 0;
+      final bytes = <int>[];
+      await for (final chunk in response.stream) {
+        bytes.addAll(chunk);
+        received += chunk.length;
+        if (total > 0 && mounted && _activeFileTransfer?.transferId == transferId) {
+          setState(() => _activeFileTransfer!.progress = received / total * 100);
+        }
+      }
+      _fileTransferClient = null;
+
+      // macOS's file_picker throws if `bytes` is passed to saveFile() at
+      // all ("Bytes are not supported on macOS") — verified against the
+      // installed package source, not assumed. Ask for a path only, on
+      // every platform, and write via dart:io ourselves; this is also what
+      // keeps this call uniform across macOS/Windows instead of branching.
+      final savePath = await FilePicker.platform.saveFile(fileName: fileName);
+      if (savePath == null) {
+        if (mounted && _activeFileTransfer?.transferId == transferId) {
+          setState(() => _activeFileTransfer!.status = _FileTransferStatus.cancelled);
+          _scheduleFileTransferAutoClear();
+        }
+        return;
+      }
+      await File(savePath).writeAsBytes(Uint8List.fromList(bytes));
+      if (mounted && _activeFileTransfer?.transferId == transferId) {
+        setState(() {
+          _activeFileTransfer!.status = _FileTransferStatus.complete;
+          _activeFileTransfer!.progress = 100;
+        });
+        _scheduleFileTransferAutoClear();
+      }
+    } catch (e) {
+      _fileTransferClient = null;
+      _appendLog('[file-transfer] download failed: $e');
+      if (mounted && _activeFileTransfer?.transferId == transferId) {
+        setState(() {
+          _activeFileTransfer!.status = _FileTransferStatus.failed;
+          _fileTransferError = '$e';
+        });
+        _scheduleFileTransferAutoClear();
+      }
+    } finally {
+      client.close();
+    }
   }
 
   bool get _isConnected =>
@@ -1920,11 +2317,23 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                   itemBuilder: (context, i) => _buildChatBubble(_chatMessages[i]),
                 ),
         ),
+        // File transfer (Agent<->Customer) lives inside the chat window,
+        // not a separate panel — this is the only UI surface visible while
+        // docked (_Phase.sharing routes straight to _buildDockedView(),
+        // which renders nothing but this body), so a standalone panel
+        // elsewhere in the widget tree would never actually be reachable
+        // during a real session. See _buildFileTransferPanel().
+        if (_activeFileTransfer != null) _buildFileTransferPanel(),
         const Divider(height: 1, color: AppColors.hairline),
         Padding(
           padding: const EdgeInsets.all(10),
           child: Row(
             children: [
+              IconButton(
+                tooltip: 'Send File',
+                icon: const Icon(Icons.attach_file, size: 18),
+                onPressed: _activeFileTransfer == null ? _sendFile : null,
+              ),
               Expanded(
                 child: TextField(
                   controller: _chatController,
@@ -2027,6 +2436,152 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             Text(entry.body, style: const TextStyle(color: AppColors.textPrimary, fontSize: 13)),
           ],
         ),
+      ),
+    );
+  }
+
+  String _fileTransferStatusLabel(_FileTransferStatus status) => switch (status) {
+    _FileTransferStatus.offering => 'Waiting for acceptance…',
+    _FileTransferStatus.incoming => 'Incoming file',
+    _FileTransferStatus.awaitingUpload => 'Waiting for upload to start…',
+    _FileTransferStatus.uploading => 'Sending…',
+    _FileTransferStatus.uploaded => 'Waiting for delivery…',
+    _FileTransferStatus.downloading => 'Receiving…',
+    _FileTransferStatus.complete => 'Transfer complete',
+    _FileTransferStatus.declined => 'Declined',
+    _FileTransferStatus.cancelled => 'Cancelled',
+    _FileTransferStatus.failed => 'Transfer failed',
+  };
+
+  String _formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  // Inline card inside _buildChatBody() — NOT a standalone panel. It used to
+  // be one (docked in _buildConnectedBody()'s Row), but that's dead UI:
+  // _Phase.sharing always renders _buildDockedView() instead (see build()),
+  // which shows nothing but the chat body, so a panel anywhere else is never
+  // actually reachable during a real session. One widget for the whole
+  // lifecycle (incoming/progress/terminal), sized to fit the chat body's own
+  // width rather than carrying its own fixed width/margin.
+  Widget _buildFileTransferPanel() {
+    final transfer = _activeFileTransfer!;
+    final inProgress = transfer.status == _FileTransferStatus.uploading || transfer.status == _FileTransferStatus.downloading;
+    final waiting = transfer.status == _FileTransferStatus.offering ||
+        transfer.status == _FileTransferStatus.awaitingUpload ||
+        transfer.status == _FileTransferStatus.uploaded;
+    final terminal = transfer.status == _FileTransferStatus.complete ||
+        transfer.status == _FileTransferStatus.declined ||
+        transfer.status == _FileTransferStatus.cancelled ||
+        transfer.status == _FileTransferStatus.failed;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: AppColors.background,
+        borderRadius: BorderRadius.circular(kCornerRadius),
+        border: Border.all(color: AppColors.hairline),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.insert_drive_file_outlined, size: 14, color: AppColors.textSecondary),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  transfer.fileName,
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (terminal)
+                GestureDetector(
+                  onTap: _resetFileTransfer,
+                  child: const Icon(Icons.close, size: 14, color: AppColors.textSecondary),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              if (transfer.status == _FileTransferStatus.complete)
+                const Icon(Icons.check_circle, size: 14, color: AppColors.live)
+              else if (transfer.status == _FileTransferStatus.failed)
+                const Icon(Icons.error_outline, size: 14, color: AppColors.danger)
+              else if (waiting || inProgress)
+                const SizedBox(
+                  width: 12, height: 12,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  _fileTransferStatusLabel(transfer.status),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: transfer.status == _FileTransferStatus.failed
+                        ? AppColors.danger
+                        : transfer.status == _FileTransferStatus.complete
+                            ? AppColors.live
+                            : AppColors.textSecondary,
+                  ),
+                ),
+              ),
+              Text(_formatFileSize(transfer.fileSize), style: TextStyle(fontSize: 10, color: AppColors.textSecondary)),
+            ],
+          ),
+          if (inProgress) ...[
+            const SizedBox(height: 8),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: transfer.progress / 100,
+                minHeight: 5,
+                backgroundColor: AppColors.surface,
+              ),
+            ),
+          ],
+          if (transfer.status == _FileTransferStatus.failed && _fileTransferError.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(_fileTransferError, style: const TextStyle(fontSize: 10, color: AppColors.danger)),
+          ],
+          if (transfer.status == _FileTransferStatus.incoming) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _declineIncomingFile,
+                    style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 6)),
+                    child: const Text('Decline', style: TextStyle(fontSize: 12)),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: _acceptIncomingFile,
+                    style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 6)),
+                    child: const Text('Accept', style: TextStyle(fontSize: 12)),
+                  ),
+                ),
+              ],
+            ),
+          ],
+          if (waiting || inProgress) ...[
+            const SizedBox(height: 6),
+            TextButton(
+              onPressed: _cancelFileTransfer,
+              style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 0)),
+              child: const Text('Cancel', style: TextStyle(fontSize: 11)),
+            ),
+          ],
+        ],
       ),
     );
   }

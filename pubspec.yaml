@@ -57,6 +57,11 @@ dependencies:
   # device identity's real ejabberd password. Never shared_preferences,
   # which is plaintext - see decision.md.
   flutter_secure_storage: ^9.2.2
+  # File transfer (Agent<->Customer) - native file picker + Save As dialog.
+  # http (already a dependency) covers upload/download streaming with
+  # manually-tracked progress - no dio needed, see decision.md "File
+  # Transfer V1".
+  file_picker: ^8.1.6
 
 dev_dependencies:
   flutter_test:
