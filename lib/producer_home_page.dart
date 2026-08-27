@@ -139,6 +139,22 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   String? _transientBanner;
   Timer? _transientBannerTimer;
 
+  // Resolves _handleClipboardCopyRequest's wait for the requesting agent's
+  // clipboard-consumer-ready ack (or its own timeout) — a single slot, not a
+  // map, since only one clipboard-copy request is ever in flight at a time
+  // (the server itself enforces this via pendingClipboardCopy).
+  void Function()? _pendingClipboardConsumerReady;
+  // Latches a clipboard-consumer-ready that arrives BEFORE
+  // _pendingClipboardConsumerReady is even registered — a real race, not
+  // theoretical: produceClipboardData() (this side) and the agent's own
+  // consumeClipboardData() both open a fresh channel concurrently, and the
+  // agent's can finish first, sending its ack while this side is still mid-
+  // produce. Without this latch that early ack is silently dropped (nothing
+  // is listening yet) and the subsequent wait times out for real, even
+  // though the agent was ready the whole time — reproduced live as "first
+  // copy in a session works, a later one hangs the full 10s".
+  bool _clipboardConsumerReadyReceived = false;
+
   // Dock-to-corner (replaces the earlier minimize-on-share behavior): the
   // window's size/position from just before docking, restored verbatim on
   // session end. Null whenever the window isn't currently docked.
@@ -831,9 +847,26 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       case 'clipboard-data-consumer-params':
         _appendLog('[clipboard] data-consumer-params received — wiring paste-to-customer');
         await _signaling.consumeClipboardData(msg);
+        // Tell the producing agent this consumer is genuinely open — its own
+        // produce-side wait alone can't see whether OUR local negotiation
+        // has also finished; without this ack the agent could send before
+        // we're actually ready to receive. See mediasoup_signaling.dart's
+        // consumeClipboardData().
+        _xmpp?.sendToComponent({'type': 'clipboard-consumer-ready', 'sid': _signaling.sid});
 
       case 'clipboard-data-producer-created':
         _signaling.resolveClipboardProduceData(msg['dataProducerId'] as String);
+
+      // The agent's clipboard DataConsumer (Copy from Customer direction)
+      // has actually finished opening — resolves _handleClipboardCopyRequest's
+      // wait before it calls sendClipboardData(); see that function. May
+      // arrive before that wait is even registered (see
+      // _clipboardConsumerReadyReceived's doc comment) — latch it either way.
+      case 'clipboard-consumer-ready':
+        _clipboardConsumerReadyReceived = true;
+        final cb = _pendingClipboardConsumerReady;
+        _pendingClipboardConsumerReady = null;
+        cb?.call();
 
       case 'clipboard-applied':
         _appendLog('[clipboard] agent applied the clipboard content we sent');
@@ -1237,6 +1270,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       _appendLog('_signaling.cleanup failed: $e');
     }
     _agentOnHold = false;
+    _pendingClipboardConsumerReady = null;
+    _clipboardConsumerReadyReceived = false;
     _xmppReconnecting = false;
     _mediasoupRecovering = false;
     _consentTimer?.cancel();
@@ -1428,6 +1463,21 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       return;
     }
 
+    // Fire this customer's own native copy shortcut on itself first, so
+    // whatever's currently selected gets copied even if the user never
+    // explicitly pressed a copy shortcut — matches the target UX (agent
+    // selects text via forwarded mouse, clicks "Copy from Customer", done).
+    // Deliberately best-effort: a failure here (e.g. Accessibility
+    // permission not yet granted for the injector) must not block reading
+    // whatever's already on the clipboard from an earlier manual copy —
+    // see decision.md ("Cross-Platform Copy Shortcut Handling") for why
+    // this exists only here, never as a translation of forwarded keystrokes.
+    try {
+      await pressNativeCopyShortcut();
+    } catch (e) {
+      _appendLog('[clipboard] native copy shortcut failed (continuing with existing clipboard contents): $e');
+    }
+
     ClipboardData? data;
     try {
       // Flutter's own cross-platform clipboard API (already used elsewhere
@@ -1464,10 +1514,45 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       return;
     }
 
+    // Reset before produce — a leftover true from an earlier request (or,
+    // in principle, a not-yet-consumed one) must never let this request skip
+    // its own wait below.
+    _clipboardConsumerReadyReceived = false;
     try {
       await _signaling.produceClipboardData();
     } catch (e) {
       _appendLog('[clipboard] produce failed: $e');
+      _xmpp?.sendToComponent({
+        'type': 'clipboard-copy-unavailable',
+        'sid': sid,
+        'reason': 'clipboard-unavailable',
+      });
+      return;
+    }
+
+    // Wait for the requesting agent's own DataConsumer to actually be open
+    // before sending — produceClipboardData() only confirms THIS side is
+    // ready. Without this, the agent could be sent data before its own
+    // local negotiation finished, which is exactly how the original bug
+    // manifested (signaling completed, nothing was ever received). The
+    // agent's ack may have already arrived WHILE we were awaiting
+    // produceClipboardData() above (a real race — the agent's own consumer
+    // can finish opening before our producer does) — check the latch first
+    // so we don't wait a full timeout for a message that already came.
+    try {
+      if (!_clipboardConsumerReadyReceived) {
+        final completer = Completer<void>();
+        _pendingClipboardConsumerReady = () {
+          if (!completer.isCompleted) completer.complete();
+        };
+        await completer.future.timeout(
+          produceTimeout,
+          onTimeout: () => throw StateError('agent clipboard consumer never became ready'),
+        );
+      }
+    } catch (e) {
+      _pendingClipboardConsumerReady = null;
+      _appendLog('[clipboard] agent consumer never became ready: $e');
       _xmpp?.sendToComponent({
         'type': 'clipboard-copy-unavailable',
         'sid': sid,

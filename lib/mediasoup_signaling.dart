@@ -595,14 +595,38 @@ class MediasoupSignaling {
     await consumeData(params);
   }
 
-  /// "Copy from Customer": lazily creates this customer's clipboard
-  /// DataProducer on the send transport — idempotent, a no-op once already
-  /// created and still open this session, since the same producer is reused
-  /// across repeated copy requests from any agent.
+  /// "Copy from Customer": creates a fresh clipboard DataProducer on the
+  /// send transport for THIS request. Deliberately NOT reused across
+  /// requests — an earlier version reused an existing open producer as an
+  /// optimization, which broke the protocol: the server only learns which
+  /// agent is waiting, and only creates that agent's consumer, in response
+  /// to receiving clipboard-produce-data (see clipboardHandlers.js's
+  /// handleClipboardProduceData). Skipping that message on a "reuse" meant
+  /// the server's pendingClipboardCopy was never fulfilled or cleared on any
+  /// request after the first, silently hanging every subsequent copy until
+  /// its own 10s timeout. A fresh DataProducer per request (closing the
+  /// prior one first) is the actual fix — this is a human-paced, occasional
+  /// action, not a hot path, so the extra signaling round trip costs nothing
+  /// that matters.
+  ///
+  /// Does not return until the underlying RTCDataChannel has actually
+  /// reached the "open" state, not just until the produce-data signaling
+  /// round trip (transport.produceData()'s local SDP renegotiation +
+  /// clipboard-produce-data/clipboard-data-producer-created ack) has
+  /// completed. Those two are NOT the same thing: this is the first-ever
+  /// data channel added to _sendTransport (previously video-only), so the
+  /// SDP renegotiation that provisions it happens well after the transport's
+  /// original connect — the RTCDataChannel object exists and the vendored
+  /// mediasoup-client's own signaling considers the producer "created" the
+  /// moment that renegotiation completes, but the channel can still take a
+  /// little longer to actually finish opening at the WebRTC layer. Calling
+  /// DataProducer.send() before that finishes doesn't throw (it's not
+  /// guarded by a readyState check - see data_producer.dart) - it appears to
+  /// succeed and the bytes are simply never delivered, which is exactly the
+  /// "signaling completes, agent never receives anything" symptom this fixes.
   Future<void> produceClipboardData() async {
-    if (_clipboardDataProducer != null && !_clipboardDataProducer!.closed) {
-      return;
-    }
+    _clipboardDataProducer?.close();
+    _clipboardDataProducer = null;
     final transport = _sendTransport;
     if (transport == null) {
       throw StateError('[MediasoupSignaling] send transport not created');
@@ -613,7 +637,7 @@ class MediasoupSignaling {
     transport.dataProducerCallback = (dataProducer) {
       _clipboardDataProducer = dataProducer as DataProducer;
       // ignore: avoid_print
-      print('[MediasoupSignaling] clipboard dataProducer created: ${_clipboardDataProducer!.id}');
+      print('[MediasoupSignaling] clipboard dataProducer created: ${_clipboardDataProducer!.id}, readyState=${_clipboardDataProducer!.readyState}');
       if (!completer.isCompleted) completer.complete();
     };
     // ordered:true + a generous maxRetransmits is the closest this vendored
@@ -634,6 +658,39 @@ class MediasoupSignaling {
       onTimeout: () =>
           throw StateError('produce-data (clipboard): local ack timeout'),
     );
+    await _waitForDataProducerOpen(_clipboardDataProducer!);
+  }
+
+  /// Resolves once [producer]'s underlying RTCDataChannel reports
+  /// RTCDataChannelOpen — immediately if it's already reached that (the
+  /// negotiation round trip sometimes finishes fast enough on its own),
+  /// otherwise waits for its "open" event. See produceClipboardData()'s doc
+  /// comment for why this distinction is load-bearing here specifically,
+  /// unlike the input data channel (which has never needed this - it's
+  /// created early, well before anything is sent on it).
+  Future<void> _waitForDataProducerOpen(DataProducer producer) async {
+    if (producer.readyState == RTCDataChannelState.RTCDataChannelOpen) {
+      return;
+    }
+    // ignore: avoid_print
+    print('[MediasoupSignaling] clipboard dataProducer not yet open (readyState=${producer.readyState}) — waiting');
+    final completer = Completer<void>();
+    // once(), not on() — self-removes after firing, so there's no listener
+    // to leak and no risk of a manual off('open') clobbering some other
+    // 'open' listener on this same emitter (off() here removes ALL
+    // listeners for the event, not just this one — events2's API, not this
+    // codebase's choice).
+    producer.once('open', (dynamic _) {
+      if (!completer.isCompleted) completer.complete();
+    });
+    await completer.future.timeout(
+      produceTimeout,
+      onTimeout: () => throw StateError(
+        'clipboard data channel never reached open (readyState=${producer.readyState})',
+      ),
+    );
+    // ignore: avoid_print
+    print('[MediasoupSignaling] clipboard dataProducer now open');
   }
 
   /// Sends `text` over this customer's already-open clipboard producer.
@@ -712,6 +769,31 @@ class MediasoupSignaling {
       protocol: (params['protocol'] as String?) ?? '',
     );
     await completer.future;
+
+    // consumeData()'s completer resolving confirms the DataConsumer object/
+    // local negotiation, not that its RTCDataChannel has actually finished
+    // opening — same reasoning as produceClipboardData()'s
+    // _waitForDataProducerOpen. This is the receiving-side half of "Paste to
+    // Customer"; sendClipboardData() (agent side) now waits for the
+    // clipboard-consumer-ready ack this triggers below before sending, so
+    // getting this right matters just as much as the producer-side fix.
+    final consumer = _clipboardDataConsumer!;
+    if (consumer.readyState != RTCDataChannelState.RTCDataChannelOpen) {
+      // ignore: avoid_print
+      print('[MediasoupSignaling] clipboard dataConsumer not yet open (readyState=${consumer.readyState}) — waiting');
+      final openCompleter = Completer<void>();
+      consumer.once('open', (dynamic _) {
+        if (!openCompleter.isCompleted) openCompleter.complete();
+      });
+      await openCompleter.future.timeout(
+        produceTimeout,
+        onTimeout: () => throw StateError(
+          'clipboard consumer never reached open (readyState=${consumer.readyState})',
+        ),
+      );
+      // ignore: avoid_print
+      print('[MediasoupSignaling] clipboard dataConsumer now open');
+    }
   }
 
   Future<void> _handleClipboardMessage(RTCDataChannelMessage message) async {

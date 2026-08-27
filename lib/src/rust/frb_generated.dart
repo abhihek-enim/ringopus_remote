@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 644000415;
+  int get rustContentHash => 153969414;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -88,6 +88,8 @@ abstract class RustLibApi extends BaseApi {
   Future<void> crateApiInputInjectInitApp();
 
   Future<void> crateApiInputInjectInjectInput({required String payloadJson});
+
+  Future<void> crateApiInputInjectPressNativeCopyShortcut();
 
   Future<void> crateApiInputInjectStartInputInjection();
 
@@ -218,7 +220,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "inject_input", argNames: ["payloadJson"]);
 
   @override
-  Future<void> crateApiInputInjectStartInputInjection() {
+  Future<void> crateApiInputInjectPressNativeCopyShortcut() {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
@@ -227,6 +229,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             generalizedFrbRustBinding,
             serializer,
             funcId: 5,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiInputInjectPressNativeCopyShortcutConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiInputInjectPressNativeCopyShortcutConstMeta =>
+      const TaskConstMeta(
+        debugName: "press_native_copy_shortcut",
+        argNames: [],
+      );
+
+  @override
+  Future<void> crateApiInputInjectStartInputInjection() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
             port: port_,
           );
         },
@@ -253,7 +285,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 7,
             port: port_,
           );
         },

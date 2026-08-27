@@ -208,6 +208,56 @@ fn injector_sender() -> &'static Sender<InputEvent> {
     })
 }
 
+/// Fires this customer's own native copy shortcut (Cmd+C on macOS, Ctrl+C
+/// elsewhere) on itself, then gives the focused app a moment to react before
+/// returning. Called ONLY from the explicit "Copy from Customer" request
+/// handler (producer_home_page.dart's _handleClipboardCopyRequest) — never
+/// from agent-forwarded input. This is deliberately not a general Ctrl<->Cmd
+/// translation of forwarded keystrokes: that would hijack e.g. a terminal's
+/// Ctrl+C (SIGINT) the moment an agent typed it for an unrelated reason, with
+/// no way to tell the two apart from a raw key event alone. Firing only in
+/// response to an explicit, already-authorized copy request is a fundamentally
+/// different (and far rarer) risk than intercepting every incidental Ctrl+C -
+/// see decision.md ("Cross-Platform Copy Shortcut Handling") for the full
+/// design rationale, including why transparent interception was rejected.
+///
+/// Reuses the injector thread/channel (constructing InputEvents directly,
+/// skipping the JSON round-trip inject_input() does for agent-sourced events)
+/// so this gets the same macOS main-thread handling and Enigo lazy-init-with-
+/// retry as every other injected key, instead of duplicating that logic.
+pub fn press_native_copy_shortcut() -> Result<(), String> {
+    let modifier = if cfg!(target_os = "macos") { "Meta" } else { "Control" };
+    let sender = injector_sender();
+    let held = |on: bool| InputEvent {
+        event_type: String::new(),
+        x: None,
+        y: None,
+        button: None,
+        key: None,
+        on: None,
+        delta_x: None,
+        delta_y: None,
+        ctrl: Some(on && modifier == "Control"),
+        meta: Some(on && modifier == "Meta"),
+    };
+    let synthetic = [
+        InputEvent { event_type: "keydown".into(), key: Some(modifier.into()), ..held(true) },
+        InputEvent { event_type: "keydown".into(), key: Some("c".into()), ..held(true) },
+        InputEvent { event_type: "keyup".into(), key: Some("c".into()), ..held(false) },
+        InputEvent { event_type: "keyup".into(), key: Some(modifier.into()), ..held(false) },
+    ];
+    for event in synthetic {
+        sender.send(event).map_err(|e| e.to_string())?;
+    }
+    // No completion signal comes back from the injector thread - this is a
+    // pragmatic settle delay (same category of heuristic already used
+    // elsewhere in this app, e.g. the video reveal gate's resize debounce)
+    // giving the target app time to actually update its clipboard before
+    // the caller reads it.
+    thread::sleep(std::time::Duration::from_millis(200));
+    Ok(())
+}
+
 fn injector_loop(rx: Receiver<InputEvent>) {
     // Enigo init is lazy and retried per event rather than done once up
     // front: on macOS Enigo::new() fails until the user grants Accessibility

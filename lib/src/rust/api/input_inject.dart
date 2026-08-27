@@ -18,6 +18,26 @@ Future<void> startInputInjection() =>
 Future<void> stopInputInjection() =>
     RustLib.instance.api.crateApiInputInjectStopInputInjection();
 
+/// Fires this customer's own native copy shortcut (Cmd+C on macOS, Ctrl+C
+/// elsewhere) on itself, then gives the focused app a moment to react before
+/// returning. Called ONLY from the explicit "Copy from Customer" request
+/// handler (producer_home_page.dart's _handleClipboardCopyRequest) — never
+/// from agent-forwarded input. This is deliberately not a general Ctrl<->Cmd
+/// translation of forwarded keystrokes: that would hijack e.g. a terminal's
+/// Ctrl+C (SIGINT) the moment an agent typed it for an unrelated reason, with
+/// no way to tell the two apart from a raw key event alone. Firing only in
+/// response to an explicit, already-authorized copy request is a fundamentally
+/// different (and far rarer) risk than intercepting every incidental Ctrl+C -
+/// see decision.md ("Cross-Platform Copy Shortcut Handling") for the full
+/// design rationale, including why transparent interception was rejected.
+///
+/// Reuses the injector thread/channel (constructing InputEvents directly,
+/// skipping the JSON round-trip inject_input() does for agent-sourced events)
+/// so this gets the same macOS main-thread handling and Enigo lazy-init-with-
+/// retry as every other injected key, instead of duplicating that logic.
+Future<void> pressNativeCopyShortcut() =>
+    RustLib.instance.api.crateApiInputInjectPressNativeCopyShortcut();
+
 /// Called from Dart with the raw JSON string received on the calleeRecv
 /// data channel - same shape the reference Tauri app already deserializes
 /// with serde, no reformatting needed on the Dart side. Returns immediately
