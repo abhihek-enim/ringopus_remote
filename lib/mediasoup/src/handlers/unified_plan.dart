@@ -320,10 +320,25 @@ class UnifiedPlan extends HandlerInterface {
         initOptions.maxRetransmits;
     initOptions.protocol = options.protocol;
 
+    // DIAGNOSTIC (Part 4 of the cross-platform copy/paste plan) — recv-side
+    // counterpart of sendDataChannel()'s logging below. The reported
+    // "Paste to Customer" failure ("clipboard temporarily unavailable") is
+    // this side hanging without ever reaching 'open'; remove once root-caused.
+    final bool isRepeatDataChannel = _hasDataChannelMediaSection;
+    // ignore: avoid_print
+    print(
+      '[UnifiedPlan] receiveDataChannel: label=${options.label} streamId=${initOptions.id} '
+      'repeat=$isRepeatDataChannel (hasDataChannelMediaSection was $isRepeatDataChannel before this call)',
+    );
+
     RTCDataChannel dataChannel = await _pc!.createDataChannel(
       options.label,
       initOptions,
     );
+    dataChannel.stateChangeStream.listen((state) {
+      // ignore: avoid_print
+      print('[UnifiedPlan] dataChannel(label=${options.label}, repeat=$isRepeatDataChannel) state -> $state');
+    });
 
     // If this is the first DataChannel we need to create the SDP offer with
     // m=application section.
