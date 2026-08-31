@@ -27,6 +27,15 @@ const Duration connectTimeout = Duration(seconds: 10);
 // deny_unknown_fields).
 const String kClipboardDataLabel = 'oojack-clipboard-v1';
 
+// Reliable/ordered SCTP label for discrete input events (keydown/keyup/
+// capslock/mousedown/mouseup) — separate from the existing unordered/lossy
+// "remote-control" channel (mousemove/scroll). A modifier chord like Ctrl+C
+// is 4 separate packets; on the lossy channel they could arrive reordered
+// or get dropped with nothing downstream to buffer/correlate them before
+// injecting into the OS, so the OS could see an unmodified letter with no
+// real modifier held. This channel fixes that by construction.
+const String kKeyboardDataLabel = 'oojack-keyboard-v1';
+
 // Matches the plan's application-level cap — see decision docs. Enforced
 // both sender-side (never send an oversized payload) and receiver-side
 // (defense-in-depth against a modified peer).
@@ -78,6 +87,13 @@ class MediasoupSignaling {
   Producer? _producer;
   DataProducer? _dataProducer;
   DataConsumer? _dataConsumer;
+  // Reliable/ordered discrete-input channel — see kKeyboardDataLabel. A
+  // fully separate DataConsumer from _dataConsumer above, but its message
+  // handler forwards straight to injectInput() exactly the same way (Rust's
+  // handle_event() is agnostic to which DataChannel a payload arrived on;
+  // this channel's whole point is stronger delivery guarantees, not a
+  // different consumer).
+  DataConsumer? _keyboardDataConsumer;
   String sid = '';
   void Function(Map<String, dynamic> msg)? sendToComponent;
 
@@ -99,7 +115,12 @@ class MediasoupSignaling {
   /// banner in producer_home_page.dart. Separate from the XMPP
   /// clipboard-applied/clipboard-apply-failed ack this class sends to the
   /// agent, which happens regardless of whether this callback is set.
-  void Function({required bool success, String? reason})? onClipboardPasteResult;
+  // appliedText: the content actually written to the OS clipboard on
+  // success — used by producer_home_page.dart's clipboard watcher (Part 3)
+  // to update its own change-detection baseline the moment inbound synced
+  // content lands, so it doesn't mistake that write for a new LOCAL change
+  // and loop it straight back to the agent.
+  void Function({required bool success, String? reason, String? appliedText})? onClipboardPasteResult;
 
   // ICE-derived connection state for whichever transport just changed -
   // label is 'send'/'recv', state is 'connecting'/'connected'/'failed'/
@@ -595,6 +616,62 @@ class MediasoupSignaling {
     await consumeData(params);
   }
 
+  /// Reliable/ordered discrete-input consumer — see kKeyboardDataLabel.
+  /// Message handler forwards straight to injectInput(), same as
+  /// consumeData()'s (input) above, minus the mousemove-seq logic (this
+  /// channel never carries mousemove, so there's nothing to discard).
+  Future<void> consumeKeyboardData(Map<String, dynamic> params) async {
+    final transport = _recvTransport;
+    if (transport == null) {
+      throw StateError('[MediasoupSignaling] recv transport not created');
+    }
+    await transport.handlerReady;
+
+    // Shares Transport.dataConsumerCallback with consumeData()/
+    // consumeClipboardData() above — see consumeClipboardData()'s doc
+    // comment for why this is safe (every caller awaits its own completer
+    // before returning, so calls never interleave in a way that would let
+    // one reassign this field before a prior call's queued task reads it).
+    final completer = Completer<void>();
+    transport.dataConsumerCallback = (dataConsumer, [accept]) {
+      _keyboardDataConsumer = dataConsumer as DataConsumer;
+      // ignore: avoid_print
+      print('[MediasoupSignaling] keyboard dataConsumer created: ${_keyboardDataConsumer!.id}');
+      _keyboardDataConsumer!.on('message', (event) {
+        final message = (event as Map)['data'] as RTCDataChannelMessage;
+        if (message.isBinary) return;
+        injectInput(payloadJson: message.text).catchError((Object e) {
+          // ignore: avoid_print
+          print('[MediasoupSignaling] inject_input (keyboard channel) failed: $e');
+        });
+      });
+      if (!completer.isCompleted) completer.complete();
+    };
+    final sctpJson = params['sctpStreamParameters'] as Map<String, dynamic>;
+    transport.consumeData(
+      id: params['dataConsumerId'] as String,
+      dataProducerId: params['dataProducerId'] as String,
+      sctpStreamParameters: SctpStreamParameters(
+        streamId: sctpJson['streamId'] as int,
+        ordered: sctpJson['ordered'] as bool?,
+        maxPacketLifeTime: sctpJson['maxPacketLifeTime'] as int?,
+        maxRetransmits: sctpJson['maxRetransmits'] as int?,
+      ),
+      label: (params['label'] as String?) ?? kKeyboardDataLabel,
+      protocol: (params['protocol'] as String?) ?? '',
+    );
+    await completer.future;
+  }
+
+  /// Closes and replaces the keyboard consumer — same "different agent takes
+  /// over" case rebindDataConsumer() handles for input, kept as a separate
+  /// method since they're two independent DataConsumer objects.
+  Future<void> rebindKeyboardDataConsumer(Map<String, dynamic> params) async {
+    _keyboardDataConsumer?.close();
+    _keyboardDataConsumer = null;
+    await consumeKeyboardData(params);
+  }
+
   /// "Copy from Customer": creates a fresh clipboard DataProducer on the
   /// send transport for THIS request. Deliberately NOT reused across
   /// requests — an earlier version reused an existing open producer as an
@@ -839,7 +916,7 @@ class MediasoupSignaling {
       'contentType': contentType,
       'size': utf8.encode(payload).length,
     });
-    onClipboardPasteResult?.call(success: true);
+    onClipboardPasteResult?.call(success: true, appliedText: payload);
     // ignore: avoid_print
     print('[MediasoupSignaling] clipboard paste applied (transferId=$transferId)');
   }
@@ -951,6 +1028,7 @@ class MediasoupSignaling {
     _dataConsumer?.close();
     _clipboardDataProducer?.close();
     _clipboardDataConsumer?.close();
+    _keyboardDataConsumer?.close();
     await _sendTransport?.close();
     await _recvTransport?.close();
     _producer = null;
@@ -958,6 +1036,7 @@ class MediasoupSignaling {
     _dataConsumer = null;
     _clipboardDataProducer = null;
     _clipboardDataConsumer = null;
+    _keyboardDataConsumer = null;
     _sendTransport = null;
     _recvTransport = null;
     sid = '';

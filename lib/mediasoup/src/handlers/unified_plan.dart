@@ -875,10 +875,29 @@ class UnifiedPlan extends HandlerInterface {
     initOptions.protocol = options.protocol ?? initOptions.protocol;
     // initOptions.priority = options.priority;
 
+    // DIAGNOSTIC (Part 4 of the cross-platform copy/paste plan — root-
+    // causing the shelved "second Copy from Customer hangs" bug): capture
+    // whether this is the FIRST data channel on this transport or a repeat
+    // one, before the flag below flips, and log every local state
+    // transition this specific channel goes through. A repeat channel
+    // that never reaches 'open' (stuck in 'connecting') would confirm the
+    // suspected gap in negotiated-channel handling without an SDP
+    // renegotiation for anything past the first; remove once root-caused.
+    final bool isRepeatDataChannel = _hasDataChannelMediaSection;
+    // ignore: avoid_print
+    print(
+      '[UnifiedPlan] sendDataChannel: label=${options.label} streamId=$_nextSendSctpStreamId '
+      'repeat=$isRepeatDataChannel (hasDataChannelMediaSection was $isRepeatDataChannel before this call)',
+    );
+
     RTCDataChannel dataChannel = await _pc!.createDataChannel(
       options.label!,
       initOptions,
     );
+    dataChannel.stateChangeStream.listen((state) {
+      // ignore: avoid_print
+      print('[UnifiedPlan] dataChannel(label=${options.label}, repeat=$isRepeatDataChannel) state -> $state');
+    });
 
     // Increase next id.
     _nextSendSctpStreamId = ++_nextSendSctpStreamId % SCTP_NUM_STREAMS.MIS;

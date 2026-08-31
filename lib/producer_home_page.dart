@@ -214,7 +214,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   String? _transientBanner;
   Timer? _transientBannerTimer;
 
-  // Resolves _handleClipboardCopyRequest's wait for the requesting agent's
+  // Resolves _sendClipboardTextToAgent's wait for the requesting agent's
   // clipboard-consumer-ready ack (or its own timeout) — a single slot, not a
   // map, since only one clipboard-copy request is ever in flight at a time
   // (the server itself enforces this via pendingClipboardCopy).
@@ -229,6 +229,28 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   // though the agent was ready the whole time — reproduced live as "first
   // copy in a session works, a later one hangs the full 10s".
   bool _clipboardConsumerReadyReceived = false;
+
+  // Cross-clipboard, continuous background watcher (Part 3 of the
+  // cross-platform copy/paste redesign) — RustDesk-style: poll this
+  // customer's own OS clipboard while sharing+in-control, push a change to
+  // the agent automatically instead of requiring the agent's explicit
+  // "Copy from Customer" button every time. _lastKnownClipboardText is the
+  // change-detection baseline, seeded (not synced) on watcher start and
+  // updated both on a local detected change and whenever inbound synced
+  // content is applied (_onClipboardPasteResult) — see that field's use
+  // sites for why this beats a hash+timeout suppression window.
+  Timer? _clipboardWatchTimer;
+  String? _lastKnownClipboardText;
+  static const Duration _kClipboardWatchInterval = Duration(milliseconds: 500);
+  // Single-in-flight guard for the push path specifically (server-side
+  // pendingClipboardCopy already prevents overlap; this just avoids firing
+  // a request we already know will be rejected). _pendingClipboardPushText
+  // is the content a push-offer was sent for, consumed by
+  // clipboard-push-accepted; _clipboardPushTimeoutTimer guards against the
+  // offer being silently dropped (e.g. a mid-flight controller change).
+  bool _clipboardPushInFlight = false;
+  String? _pendingClipboardPushText;
+  Timer? _clipboardPushTimeoutTimer;
 
   // File transfer (Agent<->Customer). One at a time, no queue — see
   // _ActiveFileTransfer's doc comment. _fileTransferClient is whichever
@@ -365,8 +387,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   // Fired by MediasoupSignaling once an inbound "Paste to Customer" payload
   // has been applied (or failed to apply) to the local OS clipboard. The
   // XMPP ack to the agent is sent by _signaling itself, independent of this
-  // — this is purely local UI feedback.
-  void _onClipboardPasteResult({required bool success, String? reason}) {
+  // — this is purely local UI feedback, PLUS (Part 3) updating the
+  // clipboard-watcher baseline so the poll loop doesn't mistake this write
+  // for a new local change and loop it straight back to the agent.
+  void _onClipboardPasteResult({required bool success, String? reason, String? appliedText}) {
+    if (success && appliedText != null) _lastKnownClipboardText = appliedText;
     _showTransientBanner(
       success ? 'Received clipboard from agent' : 'Clipboard from agent failed${reason != null ? ' ($reason)' : ''}',
     );
@@ -905,6 +930,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _appendLog('[mediasoup] data-consumer-params received — wiring input injection');
         await _signaling.rebindDataConsumer(msg);
 
+      case 'keyboard-data-consumer-params':
+        _appendLog('[mediasoup] keyboard-data-consumer-params received — wiring reliable input injection');
+        await _signaling.rebindKeyboardDataConsumer(msg);
+
       case 'session-held':
         _appendLog('--- session held (sid=${msg['sid']}) ---');
         // Mirrors fileTransfer.js's own killTransfersForSession(sid, 'hold')
@@ -932,13 +961,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         }
         _setHold(false, 'Sharing "$_sourceName"');
 
-      // Cross-clipboard, both directions. All five message types are
+      // Cross-clipboard, both directions. These message types are
       // signaling-channel (XMPP), not the clipboard DataChannel itself —
       // that channel's actual payload is handled entirely inside
       // MediasoupSignaling (consumeClipboardData/_handleClipboardMessage).
-      case 'clipboard-copy-request':
-        await _handleClipboardCopyRequest(msg);
-
+      // "Copy from Customer" has no agent-initiated request anymore — see
+      // _pushClipboardToAgent below, the background watcher (Part 3) is
+      // the sole trigger now.
       case 'clipboard-data-consumer-params':
         _appendLog('[clipboard] data-consumer-params received — wiring paste-to-customer');
         await _signaling.consumeClipboardData(msg);
@@ -953,7 +982,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         _signaling.resolveClipboardProduceData(msg['dataProducerId'] as String);
 
       // The agent's clipboard DataConsumer (Copy from Customer direction)
-      // has actually finished opening — resolves _handleClipboardCopyRequest's
+      // has actually finished opening — resolves _sendClipboardTextToAgent's
       // wait before it calls sendClipboardData(); see that function. May
       // arrive before that wait is even registered (see
       // _clipboardConsumerReadyReceived's doc comment) — latch it either way.
@@ -973,12 +1002,35 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
       // Generic rejection of our own clipboard-produce-data (e.g. a
       // session-state race) — distinct from clipboard-copy-unavailable
-      // (which _handleClipboardCopyRequest sends itself, before ever
-      // calling produceClipboardData). Without this case the pending
+      // (which _sendClipboardTextToAgent sends itself, on a size/produce
+      // failure). Without this case the pending
       // produceClipboardData() call would just run out its own
-      // produceTimeout instead of failing promptly.
+      // produceTimeout instead of failing promptly. Also the rejection path
+      // for our own clipboard-push-offer (Part 3) — e.g. request-already-
+      // pending, an expected/routine outcome now that pushes can fire from
+      // a background timer, not just a rare human-caused race — so this
+      // stays a log line, never a visible error banner, and simply clears
+      // the pending push state instead of waiting out its own timeout.
       case 'clipboard-error':
         _appendLog('[clipboard] rejected: ${msg['reason']}');
+        if (_pendingClipboardPushText != null) {
+          _clipboardPushTimeoutTimer?.cancel();
+          _pendingClipboardPushText = null;
+          _clipboardPushInFlight = false;
+        }
+
+      // Customer-initiated push offer (Part 3) was accepted — send whatever
+      // content _pushClipboardToAgent captured for this offer, through the
+      // same body the explicit request path uses.
+      case 'clipboard-push-accepted':
+        _clipboardPushTimeoutTimer?.cancel();
+        final pushText = _pendingClipboardPushText;
+        _pendingClipboardPushText = null;
+        if (pushText != null) {
+          unawaited(_sendClipboardTextToAgent(pushText).whenComplete(() => _clipboardPushInFlight = false));
+        } else {
+          _clipboardPushInFlight = false;
+        }
 
       // File transfer (Agent<->Customer). Bytes never touch this channel —
       // these five are the only server-generated pushes for this feature;
@@ -1127,12 +1179,20 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
   void _sendChatMessage() {
     final text = _chatController.text.trim();
+    if (text.isEmpty) return;
+    _sendChatMessageText(text);
+    _chatController.clear();
+  }
+
+  // Shared by the compose-row send and the automatic "Sent a file: X" note
+  // posted when a file upload starts (see _startFileUpload) — factored out
+  // so the latter doesn't have to go through the text field at all.
+  void _sendChatMessageText(String text) {
     if (text.isEmpty || _xmpp == null || _signaling.sid.isEmpty) return;
     _xmpp!.sendToComponent({'type': 'chat-message', 'sid': _signaling.sid, 'body': text});
     if (mounted) {
       setState(() => _chatMessages.add(_ChatEntry(fromMe: true, from: 'You', body: text)));
     }
-    _chatController.clear();
     _scrollChatToBottom();
   }
 
@@ -1214,6 +1274,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       _renderer.srcObject = stream;
       setState(() => _sourceName = source.name);
       _setPhase(_Phase.sharing, 'Sharing “${source.name}”');
+      _startClipboardWatcher();
       // Dock to a small always-on-top corner the instant sharing actually
       // starts, instead of minimizing - the customer keeps the chat panel
       // reachable while the agent works. Also doubles as a second guard
@@ -1412,6 +1473,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _agentOnHold = false;
     _pendingClipboardConsumerReady = null;
     _clipboardConsumerReadyReceived = false;
+    _stopClipboardWatcher();
+    _lastKnownClipboardText = null;
     _resetFileTransfer();
     _xmppReconnecting = false;
     _mediasoupRecovering = false;
@@ -1589,63 +1652,19 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _appendLog('[recovery] applied restart-ice for $label — awaiting reconnect');
   }
 
-  /// Customer-side half of "Copy from Customer": read our own OS clipboard
-  /// and, on success, produce+send it to whichever agent asked. Gated the
-  /// same way hold already gates input injection — a held or stale session
-  /// must not let a backgrounded/superseded agent pull clipboard content.
-  Future<void> _handleClipboardCopyRequest(Map<String, dynamic> msg) async {
-    final sid = msg['sid'] as String?;
-    if (_phase != _Phase.sharing || _agentOnHold || sid != _signaling.sid) {
-      _xmpp?.sendToComponent({
-        'type': 'clipboard-copy-unavailable',
-        'sid': sid,
-        'reason': 'session-not-active',
-      });
-      return;
-    }
-
-    // Fire this customer's own native copy shortcut on itself first, so
-    // whatever's currently selected gets copied even if the user never
-    // explicitly pressed a copy shortcut — matches the target UX (agent
-    // selects text via forwarded mouse, clicks "Copy from Customer", done).
-    // Deliberately best-effort: a failure here (e.g. Accessibility
-    // permission not yet granted for the injector) must not block reading
-    // whatever's already on the clipboard from an earlier manual copy —
-    // see decision.md ("Cross-Platform Copy Shortcut Handling") for why
-    // this exists only here, never as a translation of forwarded keystrokes.
-    try {
-      await pressNativeCopyShortcut();
-    } catch (e) {
-      _appendLog('[clipboard] native copy shortcut failed (continuing with existing clipboard contents): $e');
-    }
-
-    ClipboardData? data;
-    try {
-      // Flutter's own cross-platform clipboard API (already used elsewhere
-      // in this app for the connect-code copy button) — no native Rust
-      // needed for plain text get/set. A null return means "nothing text
-      // there," not an error — distinct from a thrown PlatformException.
-      data = await Clipboard.getData(Clipboard.kTextPlain);
-    } catch (e) {
-      _appendLog('[clipboard] read failed: $e');
-      _xmpp?.sendToComponent({
-        'type': 'clipboard-copy-unavailable',
-        'sid': sid,
-        'reason': 'read-failed',
-      });
-      return;
-    }
-
-    final text = data?.text;
-    if (text == null || text.isEmpty) {
-      _xmpp?.sendToComponent({
-        'type': 'clipboard-copy-unavailable',
-        'sid': sid,
-        'reason': 'empty',
-      });
-      return;
-    }
-
+  // Customer-side half of "Copy from Customer" — sends whatever
+  // _pushClipboardToAgent's watcher tick already read to the current
+  // controller. Deliberately does NOT fire a native copy shortcut on this
+  // machine first (the old explicit-request flow used to, via
+  // press_native_copy_shortcut() — removed outright along with that flow,
+  // see decision.md): synthesizing a real keystroke on whatever app happens
+  // to be focused with no actual user intent behind it is exactly the risk
+  // explicit-action-only design already rejected, just relocated from a
+  // keydown handler to a timer. The watcher only ever reacts to content
+  // that's already genuinely on the clipboard. Validates size, then
+  // produces and sends over the clipboard DataChannel.
+  Future<void> _sendClipboardTextToAgent(String text) async {
+    final sid = _signaling.sid;
     if (utf8.encode(text).length > kClipboardMaxPayloadBytes) {
       _xmpp?.sendToComponent({
         'type': 'clipboard-copy-unavailable',
@@ -1704,6 +1723,74 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
     final transferId = _signaling.sendClipboardData(text);
     _appendLog('[clipboard] sent our clipboard content (transferId=$transferId)');
+  }
+
+  // ── Cross-clipboard background watcher (Part 3) ─────────────────────────
+  // RustDesk-style: poll this customer's own OS clipboard while sharing and
+  // not on hold, push a detected change to the agent automatically. Content-
+  // driven, not keystroke-driven — never inspects what caused a change, so
+  // there is no code path here that could misclassify e.g. a terminal
+  // Ctrl+C/SIGINT as a copy action (nothing here ever looks at keystrokes at
+  // all). The explicit "Copy from Customer" button/request above keeps
+  // working exactly as before, unaffected — this is a second, independent
+  // trigger for the same underlying send path.
+
+  void _startClipboardWatcher() {
+    _clipboardWatchTimer?.cancel();
+    // Seed the baseline without syncing — don't push whatever's already on
+    // the clipboard the moment sharing/control starts; only genuine changes
+    // from this point on are synced.
+    Clipboard.getData(Clipboard.kTextPlain).then((data) {
+      _lastKnownClipboardText = data?.text;
+    }).catchError((Object _) {});
+    _clipboardWatchTimer = Timer.periodic(_kClipboardWatchInterval, (_) => unawaited(_pollClipboardForChange()));
+  }
+
+  void _stopClipboardWatcher() {
+    _clipboardWatchTimer?.cancel();
+    _clipboardWatchTimer = null;
+    _clipboardPushTimeoutTimer?.cancel();
+    _clipboardPushTimeoutTimer = null;
+    _clipboardPushInFlight = false;
+    _pendingClipboardPushText = null;
+  }
+
+  Future<void> _pollClipboardForChange() async {
+    if (_phase != _Phase.sharing || _agentOnHold || _clipboardPushInFlight) return;
+    ClipboardData? data;
+    try {
+      data = await Clipboard.getData(Clipboard.kTextPlain);
+    } catch (_) {
+      return; // transient read failure — try again next tick
+    }
+    final text = data?.text;
+    if (text == null || text.isEmpty || text == _lastKnownClipboardText) return;
+    // Update the baseline immediately, before the round trip even starts —
+    // a slow push (or one that ultimately fails) must not leave the same
+    // content looking "new" again on the next tick.
+    _lastKnownClipboardText = text;
+    await _pushClipboardToAgent(text);
+  }
+
+  // Offers content to the controlling agent via the new clipboard-push-offer
+  // message (customer-initiated — the existing clipboard-copy-request flow
+  // is agent-initiated only, so a spontaneous local change has nothing to
+  // satisfy that gate without this). Continues via clipboard-push-accepted
+  // below, which calls _sendClipboardTextToAgent with the text captured
+  // here.
+  Future<void> _pushClipboardToAgent(String text) async {
+    if (_xmpp == null || _signaling.sid.isEmpty || _clipboardPushInFlight) return;
+    _clipboardPushInFlight = true;
+    _pendingClipboardPushText = text;
+    _xmpp!.sendToComponent({'type': 'clipboard-push-offer', 'sid': _signaling.sid});
+    _clipboardPushTimeoutTimer?.cancel();
+    _clipboardPushTimeoutTimer = Timer(produceTimeout, () {
+      if (_clipboardPushInFlight) {
+        _appendLog('[clipboard] push offer timed out, no accept received');
+        _clipboardPushInFlight = false;
+        _pendingClipboardPushText = null;
+      }
+    });
   }
 
   // ── File transfer (Agent<->Customer) ──────────────────────────────────
@@ -1855,6 +1942,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   Future<void> _startFileUpload(String uploadUrl, String transferId) async {
     final path = _pendingSendFilePath;
     if (path == null) return;
+    // Drop a note in chat as the upload starts, from the sending side only —
+    // gives both parties a record of the transfer in the same place as the
+    // rest of the conversation, independent of the file-transfer panel.
+    final fileName = _activeFileTransfer?.fileName;
+    if (fileName != null) _sendChatMessageText('Sent a file: $fileName');
     final client = http.Client();
     _fileTransferClient = client;
     try {
