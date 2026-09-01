@@ -202,9 +202,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   // customer clicks Allow. Auto-declines after a minute so an unanswered
   // prompt doesn't strand the agent's request forever.
   bool _consentPending = false;
-  String _pendingSessionFrom = '';
   Timer? _consentTimer;
   static const Duration _consentTimeout = Duration(seconds: 60);
+
+  // Mandatory per-session 6-digit code, minted by the orchestrator and
+  // carried on session-incoming — read this aloud to the agent as an extra
+  // authentication step. Non-null for the lifetime of a pending/in-progress
+  // consent flow; null once the session is fully active or torn down.
+  String? _sessionAuthCode;
 
   // Orthogonal to _Phase, not a new phase value: _Phase.sharing correctly
   // stays true throughout hold/transfer since capture/renderer/MediaStream
@@ -847,7 +852,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         if (mounted) {
           setState(() {
             _consentPending = true;
-            _pendingSessionFrom = (msg['from'] as String?) ?? '';
+            _sessionAuthCode = msg['authCode'] as String?;
           });
         }
         _setPhase(_Phase.sessionIncoming, 'Incoming session request');
@@ -1157,7 +1162,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     if (mounted) {
       setState(() {
         _consentPending = false;
-        _pendingSessionFrom = '';
+        _sessionAuthCode = null;
       });
     }
     _setPhase(_Phase.connected, auto ? 'Request timed out' : 'Request declined');
@@ -1480,7 +1485,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     _mediasoupRecovering = false;
     _consentTimer?.cancel();
     _consentPending = false;
-    _pendingSessionFrom = '';
+    _sessionAuthCode = null;
     _chatAvailable = false;
     _chatOpen = false;
     _chatMessages.clear();
@@ -2745,12 +2750,50 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     return '${d.substring(0, 4)} ${d.substring(4, 8)} ${d.substring(8)}';
   }
 
+  String get _formattedAuthCode {
+    final d = _sessionAuthCode ?? '';
+    if (d.length != 6) return d;
+    return '${d.substring(0, 3)} ${d.substring(3)}';
+  }
+
+  /// Compact, distinct-from-the-big-connect-code display for the mandatory
+  /// per-session auth code — shown inside the consent card (and the
+  /// post-Allow waiting state) rather than the idle-screen circular badge.
+  Widget _buildAuthCodeBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: AppColors.live.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(kCornerRadius),
+        border: Border.all(color: AppColors.live.withValues(alpha: 0.3)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            'READ THIS CODE TO YOUR AGENT',
+            style: TextStyle(
+              color: AppColors.live,
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 1.5,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            _formattedAuthCode,
+            style: appMonoStyle(fontSize: 22, fontWeight: FontWeight.w700).copyWith(letterSpacing: 4),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// What fills the preview box when there's no video: the share code while
   /// idle in guest mode, the Allow/Decline consent card while a request is
   /// pending, or the plain status text otherwise.
   Widget _buildPreviewPlaceholder() {
     if (_phase == _Phase.sessionIncoming && _consentPending) {
-      final agentName = _pendingSessionFrom.split('@').first;
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -2758,9 +2801,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
             const Icon(Icons.screen_share_outlined, size: 40, color: AppColors.textSecondary),
             const SizedBox(height: 16),
             Text(
-              agentName.isEmpty
-                  ? 'An agent wants to view your screen'
-                  : '"$agentName" wants to view your screen',
+              'You are about to share your screen to our agent.',
               style: Theme.of(context).textTheme.titleMedium,
               textAlign: TextAlign.center,
             ),
@@ -2770,6 +2811,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
               style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
               textAlign: TextAlign.center,
             ),
+            if (_sessionAuthCode != null) ...[
+              const SizedBox(height: 16),
+              _buildAuthCodeBadge(),
+            ],
             const SizedBox(height: 20),
             Row(
               mainAxisSize: MainAxisSize.min,
@@ -2789,6 +2834,36 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
                 ),
               ],
             ),
+          ],
+        ),
+      );
+    }
+
+    // Between clicking Allow and transports being ready, the auth-code
+    // exchange (mandatory, see server/sessionHandlers.js) can take up to two
+    // minutes — long enough that the code must stay visible here too, not
+    // just in the consent card above, or a customer who clicks Allow before
+    // reading it aloud loses it for the rest of this session.
+    if (_phase == _Phase.sessionIncoming && !_consentPending) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2.5),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Waiting for the agent to enter the code…',
+              style: Theme.of(context).textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
+            if (_sessionAuthCode != null) ...[
+              const SizedBox(height: 16),
+              _buildAuthCodeBadge(),
+            ],
           ],
         ),
       );
