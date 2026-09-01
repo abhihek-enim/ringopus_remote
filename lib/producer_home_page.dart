@@ -841,6 +841,20 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
         }
         _signaling.sid = sid;
         _signaling.sendToComponent = _xmpp!.sendToComponent;
+        // Re-arm the teardown choke point here, at the actual start of a new
+        // session — not only deep inside _startCapture()'s success path
+        // (still done there too, as a second, harmless layer). A session
+        // that never reaches _Phase.sharing (e.g. the agent cancels while
+        // this one is still waiting on consent/the auth code) would
+        // otherwise leave _tearingDown stuck true from the PREVIOUS
+        // session's already-completed teardown, silently no-opping this
+        // session's own _teardownSession call on its first line — the
+        // consent card / auth-code screen would then sit there forever,
+        // looking like the request is still in progress even after the
+        // agent has actually cancelled. Real bug, found live once the auth
+        // code made this waiting window human-paced (up to 2 minutes)
+        // instead of near-instant.
+        _tearingDown = false;
         // Consent gate: the session proceeds only after the customer clicks
         // Allow (which sends the session-accept the old code sent here
         // unconditionally). Decline sends session-reject, which the server
@@ -1287,7 +1301,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       // (the in-app preview loopback is handled separately, see
       // _buildPreviewPlaceholder()'s _Phase.sharing branch above).
       unawaited(_dockToCorner());
-      _tearingDown = false; // fresh session - re-arm the teardown choke point
+      _tearingDown = false; // already re-armed in session-incoming; redundant safety net here
       // Input injection is independent of video capture/produce - a Rust
       // bridge failure here (e.g. a debug-build content-hash mismatch) must
       // not abort screen sharing, which doesn't depend on it at all.

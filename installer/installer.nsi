@@ -142,6 +142,7 @@ Section "MainSection" SEC01
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
   CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall ${PRODUCT_NAME}.lnk" "$INSTDIR\Uninstall.exe"
+  CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
 
   ; Add/Remove Programs registration
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
@@ -161,6 +162,7 @@ SectionEnd
 Section "Uninstall"
   nsExec::Exec 'taskkill /F /IM "${PRODUCT_EXE}"'
 
+  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   RMDir /r "$SMPROGRAMS\${PRODUCT_NAME}"
   RMDir /r "$INSTDIR"
 
