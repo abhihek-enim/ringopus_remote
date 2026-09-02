@@ -491,8 +491,21 @@ class RTCPeerConnectionNative extends RTCPeerConnection {
         'dataChannelDict': dataChannelDict.toMap()
       });
 
+      // OOJACK PATCH: seed the channel's state from what native reports at
+      // creation time, instead of leaving it null until the first
+      // `dataChannelStateChanged` event arrives. A `negotiated: true` channel
+      // created on an already-connected SCTP transport is born 'open', so
+      // there is no state *transition* left for the native observer to
+      // deliver and the state would otherwise stay null forever. See the
+      // matching comment in common/darwin/Classes/FlutterRTCDataChannel.m.
+      // `state` is absent on platforms whose binding hasn't been patched, in
+      // which case behaviour is unchanged (null until the first event).
+      final rawState = response['state'];
       _dataChannel = RTCDataChannelNative(
-          _peerConnectionId, label, response['id'], response['flutterId']);
+          _peerConnectionId, label, response['id'], response['flutterId'],
+          state: rawState is String
+              ? rtcDataChannelStateForString(rawState)
+              : null);
       return _dataChannel!;
     } on PlatformException catch (e) {
       throw 'Unable to RTCPeerConnection::createDataChannel: ${e.message}';

@@ -45,12 +45,18 @@ class UnifiedPlan extends HandlerInterface {
   RTCPeerConnection? _pc;
   // Map of RTCTransceivers indexed by MID.
   final Map<String, RTCRtpTransceiver> _mapMidTransceiver = {};
-  // Whether a DataChannel m=application section has been created.
-  bool _hasDataChannelMediaSection = false;
   // Sending DataChannel id value counter. Incremented for each new DataChannel.
   int _nextSendSctpStreamId = 0;
   // Got transport local and remote parameters.
   bool _transportReady = false;
+  // DIAGNOSTIC (repeat-clipboard-push bug — see decision.md "Repeat-
+  // clipboard-push bug", 2026-09-02): counts per-transport data channels
+  // created, purely for log tagging — not read for any control-flow
+  // decision. The bug: the first channel created on a transport always
+  // opens; every one after it never does, with or without the SDP
+  // renegotiation both create*DataChannel() methods below now always run.
+  // Keep this logging until that's actually root-caused.
+  int _diagDataChannelCount = 0;
 
   UnifiedPlan() : super();
 
@@ -320,16 +326,9 @@ class UnifiedPlan extends HandlerInterface {
         initOptions.maxRetransmits;
     initOptions.protocol = options.protocol;
 
-    // DIAGNOSTIC (Part 4 of the cross-platform copy/paste plan) — recv-side
-    // counterpart of sendDataChannel()'s logging below. The reported
-    // "Paste to Customer" failure ("clipboard temporarily unavailable") is
-    // this side hanging without ever reaching 'open'; remove once root-caused.
-    final bool isRepeatDataChannel = _hasDataChannelMediaSection;
+    final int diagChannelNum = ++_diagDataChannelCount;
     // ignore: avoid_print
-    print(
-      '[UnifiedPlan] receiveDataChannel: label=${options.label} streamId=${initOptions.id} '
-      'repeat=$isRepeatDataChannel (hasDataChannelMediaSection was $isRepeatDataChannel before this call)',
-    );
+    print('[UnifiedPlan] receiveDataChannel: label=${options.label} streamId=${initOptions.id} channel#=$diagChannelNum');
 
     RTCDataChannel dataChannel = await _pc!.createDataChannel(
       options.label,
@@ -337,40 +336,41 @@ class UnifiedPlan extends HandlerInterface {
     );
     dataChannel.stateChangeStream.listen((state) {
       // ignore: avoid_print
-      print('[UnifiedPlan] dataChannel(label=${options.label}, repeat=$isRepeatDataChannel) state -> $state');
+      print('[UnifiedPlan] dataChannel(label=${options.label}, channel#=$diagChannelNum) state -> $state');
     });
 
-    // If this is the first DataChannel we need to create the SDP offer with
-    // m=application section.
-    if (!_hasDataChannelMediaSection) {
-      _remoteSdp.receiveSctpAssociation();
+    // Renegotiate on EVERY DataChannel, not just the first one on this
+    // transport. A negotiated RTCDataChannel (negotiated:true) doesn't need
+    // a fresh SCTP association past the first channel per the WebRTC spec,
+    // but on this platform's libwebrtc binding a repeat channel created
+    // without going through setRemoteDescription/setLocalDescription again
+    // never transitions its readyState past 'connecting' - confirmed live
+    // (root-caused the shelved "second Copy from Customer hangs" /
+    // "Paste to Customer" repeat-failure bugs, see decision.md). The mid
+    // stays the same across calls (remote_sdp.dart's receiveSctpAssociation
+    // always uses the literal 'datachannel' mid), so RemoteSdp updates the
+    // existing media section in place rather than duplicating it.
+    _remoteSdp.receiveSctpAssociation();
 
-      RTCSessionDescription offer = RTCSessionDescription(
-        _remoteSdp.getSdp(),
-        'offer',
+    RTCSessionDescription offer = RTCSessionDescription(
+      _remoteSdp.getSdp(),
+      'offer',
+    );
+
+    await _pc!.setRemoteDescription(offer);
+
+    RTCSessionDescription answer = await _pc!.createAnswer({});
+
+    if (!_transportReady) {
+      SdpObject localSdpObject = SdpObject.fromMap(parse(answer.sdp!));
+
+      await _setupTransport(
+        localDtlsRole: _forcedLocalDtlsRole ?? DtlsRole.client,
+        localSdpObject: localSdpObject,
       );
-
-      // // 'receiveDataChannel() | calling pc.setRemoteDescription() [offer:${offer.toMap()}]');
-
-      await _pc!.setRemoteDescription(offer);
-
-      RTCSessionDescription answer = await _pc!.createAnswer({});
-
-      if (!_transportReady) {
-        SdpObject localSdpObject = SdpObject.fromMap(parse(answer.sdp!));
-
-        await _setupTransport(
-          localDtlsRole: _forcedLocalDtlsRole ?? DtlsRole.client,
-          localSdpObject: localSdpObject,
-        );
-      }
-
-      // 'receiveDataChannel() | calling pc.setRemoteDescription() [answer: ${answer.toMap()}');
-
-      await _pc!.setLocalDescription(answer);
-
-      _hasDataChannelMediaSection = true;
     }
+
+    await _pc!.setLocalDescription(answer);
 
     return HandlerReceiveDataChannelResult(dataChannel: dataChannel);
   }
@@ -890,20 +890,9 @@ class UnifiedPlan extends HandlerInterface {
     initOptions.protocol = options.protocol ?? initOptions.protocol;
     // initOptions.priority = options.priority;
 
-    // DIAGNOSTIC (Part 4 of the cross-platform copy/paste plan — root-
-    // causing the shelved "second Copy from Customer hangs" bug): capture
-    // whether this is the FIRST data channel on this transport or a repeat
-    // one, before the flag below flips, and log every local state
-    // transition this specific channel goes through. A repeat channel
-    // that never reaches 'open' (stuck in 'connecting') would confirm the
-    // suspected gap in negotiated-channel handling without an SDP
-    // renegotiation for anything past the first; remove once root-caused.
-    final bool isRepeatDataChannel = _hasDataChannelMediaSection;
+    final int diagChannelNum = ++_diagDataChannelCount;
     // ignore: avoid_print
-    print(
-      '[UnifiedPlan] sendDataChannel: label=${options.label} streamId=$_nextSendSctpStreamId '
-      'repeat=$isRepeatDataChannel (hasDataChannelMediaSection was $isRepeatDataChannel before this call)',
-    );
+    print('[UnifiedPlan] sendDataChannel: label=${options.label} streamId=${initOptions.id} channel#=$diagChannelNum');
 
     RTCDataChannel dataChannel = await _pc!.createDataChannel(
       options.label!,
@@ -911,46 +900,44 @@ class UnifiedPlan extends HandlerInterface {
     );
     dataChannel.stateChangeStream.listen((state) {
       // ignore: avoid_print
-      print('[UnifiedPlan] dataChannel(label=${options.label}, repeat=$isRepeatDataChannel) state -> $state');
+      print('[UnifiedPlan] dataChannel(label=${options.label}, channel#=$diagChannelNum) state -> $state');
     });
 
     // Increase next id.
     _nextSendSctpStreamId = ++_nextSendSctpStreamId % SCTP_NUM_STREAMS.MIS;
 
-    // If this is the first DataChannel we need to create the SDP answer with
-    // m=application section.
-    if (!_hasDataChannelMediaSection) {
-      RTCSessionDescription offer = await _pc!.createOffer({});
-      SdpObject localSdpObject = SdpObject.fromMap(parse(offer.sdp!));
-      MediaObject? offerMediaObject = _firstWhereOrNull(
-        localSdpObject.media,
-        (MediaObject m) => m.type == 'application',
+    // Renegotiate on EVERY DataChannel, not just the first one on this
+    // transport — see receiveDataChannel()'s matching comment for why: a
+    // repeat negotiated RTCDataChannel's readyState never reaches 'open' on
+    // its own on this platform's libwebrtc binding, confirmed live. The
+    // local offer's m=application section keeps the same mid across calls
+    // (libwebrtc doesn't allocate a new one for an already-negotiated
+    // section), so remote_sdp.dart's sendSctpAssociation() updates the
+    // existing media section rather than duplicating it.
+    RTCSessionDescription offer = await _pc!.createOffer({});
+    SdpObject localSdpObject = SdpObject.fromMap(parse(offer.sdp!));
+    MediaObject? offerMediaObject = _firstWhereOrNull(
+      localSdpObject.media,
+      (MediaObject m) => m.type == 'application',
+    );
+
+    if (!_transportReady) {
+      await _setupTransport(
+        localDtlsRole: _forcedLocalDtlsRole ?? DtlsRole.client,
+        localSdpObject: localSdpObject,
       );
-
-      if (!_transportReady) {
-        await _setupTransport(
-          localDtlsRole: _forcedLocalDtlsRole ?? DtlsRole.client,
-          localSdpObject: localSdpObject,
-        );
-      }
-
-      // 'sendDataChannel() | calling pc.setLocalDescription() [offer:${offer.toMap()}');
-
-      await _pc!.setLocalDescription(offer);
-
-      _remoteSdp.sendSctpAssociation(offerMediaObject!);
-
-      RTCSessionDescription answer = RTCSessionDescription(
-        _remoteSdp.getSdp(),
-        'answer',
-      );
-
-      // // 'sendDataChannel() | calling pc.setRemoteDescription() [answer:${answer.toMap()}]');
-
-      await _pc!.setRemoteDescription(answer);
-
-      _hasDataChannelMediaSection = true;
     }
+
+    await _pc!.setLocalDescription(offer);
+
+    _remoteSdp.sendSctpAssociation(offerMediaObject!);
+
+    RTCSessionDescription answer = RTCSessionDescription(
+      _remoteSdp.getSdp(),
+      'answer',
+    );
+
+    await _pc!.setRemoteDescription(answer);
 
     SctpStreamParameters sctpStreamParameters = SctpStreamParameters(
       streamId: initOptions.id,

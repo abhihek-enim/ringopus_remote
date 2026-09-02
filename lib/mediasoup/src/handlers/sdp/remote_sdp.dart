@@ -269,6 +269,17 @@ class RemoteSdp {
     }
   }
 
+  // Called once per DataProducer/DataConsumer created on this transport, not
+  // just once per transport - see unified_plan.dart's sendDataChannel(),
+  // which now renegotiates for every data channel because a repeat
+  // negotiated RTCDataChannel never reaches 'open' on its own here. A repeat
+  // call's offerMediaObject carries the SAME mid as before (the underlying
+  // m=application section itself doesn't change, only the SCTP streams
+  // riding it do) - _addMediaSection() would blindly append a second,
+  // duplicate m=application section with that mid rather than updating the
+  // existing one, so this must go through _replaceMediaSection() on a
+  // repeat call, exactly like send() already does for a re-negotiated
+  // producer.
   void sendSctpAssociation(MediaObject offerMediaObject) {
     AnswerMediaSection mediaSection = AnswerMediaSection(
       iceParameters: _iceParameters,
@@ -278,9 +289,17 @@ class RemoteSdp {
       offerMediaObject: offerMediaObject,
     );
 
-    _addMediaSection(mediaSection);
+    if (!_midToIndex.containsKey(mediaSection.mid)) {
+      _addMediaSection(mediaSection);
+    } else {
+      _replaceMediaSection(mediaSection, null);
+    }
   }
 
+  // Receive-side counterpart of sendSctpAssociation() above - same reason,
+  // same fix. mid is always the literal 'datachannel' here (never derived
+  // from a remote offer), so a repeat call would collide on that exact mid
+  // every time.
   void receiveSctpAssociation({bool oldDataChannelSpec = false}) {
     OfferMediaSection mediaSection = OfferMediaSection(
       iceParameters: _iceParameters,
@@ -293,7 +312,11 @@ class RemoteSdp {
       oldDataChannelSpec: oldDataChannelSpec,
     );
 
-    _addMediaSection(mediaSection);
+    if (!_midToIndex.containsKey(mediaSection.mid)) {
+      _addMediaSection(mediaSection);
+    } else {
+      _replaceMediaSection(mediaSection, null);
+    }
   }
 
   MediaSectionIdx getNextMediaSectionIdx() {

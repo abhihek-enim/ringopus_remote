@@ -85,8 +85,12 @@
     NSString* flutterId = [[NSUUID UUID] UUIDString];
     peerConnection.dataChannels[flutterId] = dataChannel;
     dataChannel.flutterChannelId = flutterId;
-    dataChannel.delegate = self;
+    // OOJACK PATCH: clear the queue BEFORE attaching the delegate, not after.
+    // Upstream set `delegate = self` first and then wiped `eventQueue`, which
+    // discards any state-change event the delegate delivers synchronously on
+    // registration.
     dataChannel.eventQueue = nil;
+    dataChannel.delegate = self;
 
     FlutterEventChannel* eventChannel = [FlutterEventChannel
         eventChannelWithName:[NSString stringWithFormat:@"FlutterWebRTC/dataChannelEvent%1$@%2$@",
@@ -96,10 +100,37 @@
     dataChannel.eventChannel = eventChannel;
     [eventChannel setStreamHandler:dataChannel];
 
+    // OOJACK PATCH: report the channel's CURRENT readyState back to Dart.
+    //
+    // Upstream returns only label/id/flutterId, so the Dart RTCDataChannel is
+    // constructed with `_state == null` and can ONLY learn its state from a
+    // later `dataChannelDidChangeState:` delegate callback. libwebrtc's
+    // DataChannelInterface::RegisterObserver() does NOT replay the state the
+    // channel is already in, so any transition that happened at or before
+    // creation is lost forever.
+    //
+    // That is exactly the case for a `negotiated: true` channel created on an
+    // SCTP transport that is ALREADY connected: libwebrtc's SctpDataChannel
+    // has handshake_state == kHandshakeReady and connected_to_transport ==
+    // true at construction, so it goes straight to kOpen inside
+    // dataChannelForLabel:configuration: — there is no kConnecting -> kOpen
+    // transition left to observe. The first data channel on a transport works
+    // (SCTP is still connecting when it is created, so it does transition
+    // later, with the delegate attached); every subsequent one is born open
+    // and the Dart side hangs at readyState == null forever.
+    //
+    // Sampling readyState here — AFTER the delegate is attached — closes the
+    // gap from both sides: a transition before this point is caught by the
+    // sample, one after it is caught by the delegate.
+    NSString* initialState = [self stringForDataChannelState:dataChannel.readyState];
+    NSLog(@"[FlutterRTCDataChannel] createDataChannel label=%@ sctpId=%d initialReadyState=%@",
+          label, dataChannel.channelId, initialState);
+
     result(@{
       @"label" : label,
       @"id" : [NSNumber numberWithInt:dataChannel.channelId],
-      @"flutterId" : flutterId
+      @"flutterId" : flutterId,
+      @"state" : (initialState ?: (id)[NSNull null])
     });
   }
 }

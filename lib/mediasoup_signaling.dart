@@ -102,7 +102,9 @@ class MediasoupSignaling {
   // Separate from _dataProducer/_dataConsumer above (see kClipboardDataLabel).
   // _clipboardDataProducer: lazily created the first time this customer
   // needs to SEND clipboard content (responding to a "Copy from Customer"
-  // request) — reused across repeated requests within the same session.
+  // request) — closed and recreated fresh on every request within the same
+  // session, not reused (see produceClipboardData()'s own doc comment for
+  // why: reuse broke the server's per-request produce-data protocol).
   // _clipboardDataConsumer: (re)created per inbound "Paste to Customer".
   DataProducer? _clipboardDataProducer;
   DataConsumer? _clipboardDataConsumer;
@@ -357,17 +359,21 @@ class MediasoupSignaling {
     // Transport's constructor can't await.
     await transport.handlerReady;
 
-    transport.producerCallback = (producer) {
-      _producer = producer as Producer;
-      _applySenderTuning(_producer!);
-      _startSenderStatsPoller(_producer!);
-      onProducer?.call(_producer!);
-    };
     transport.produce(
       track: track,
       stream: stream,
       source: 'screen',
       codec: codec,
+      // Per-call callback (see Transport.produce()'s doc comment) - not a
+      // shared Transport.producerCallback field. No live bug here today
+      // (only caller), converted for consistency with the data-channel
+      // call sites now that the mechanism exists.
+      callback: (producer) {
+        _producer = producer as Producer;
+        _applySenderTuning(_producer!);
+        _startSenderStatsPoller(_producer!);
+        onProducer?.call(_producer!);
+      },
       // videoGoogleStartBitrate hints the encoder to start near full quality
       // instead of libwebrtc's ~300kbps BWE cold-start default - confirmed via
       // [SenderStats] on a live session: qualityLimitationReason=='bandwidth'
@@ -547,47 +553,11 @@ class MediasoupSignaling {
     }
     await transport.handlerReady;
 
-    // dataConsumerCallback?.call(dataConsumer, accept) - transport.dart
-    // invokes it with 2 args (same MediaSFU-specific `accept` addition as
-    // consume()'s callback above); this crashed live with NoSuchMethodError
-    // until the second param was added.
-    transport.dataConsumerCallback = (dataConsumer, [accept]) {
-      _dataConsumer = dataConsumer as DataConsumer;
-      // ignore: avoid_print
-      print('[MediasoupSignaling] dataConsumer created: ${_dataConsumer!.id}');
-      // Payload shape confirmed from data_consumer.dart: {'data': RTCDataChannelMessage}.
-      // Forwards the raw JSON string straight through to Rust - same shape
-      // the reference Tauri app's input_inject.rs already deserializes with
-      // serde, no reformatting of the payload itself. The seq-discard check
-      // below is a forwarding decision, not a reformat.
-      _dataConsumer!.on('message', (event) {
-        final message = (event as Map)['data'] as RTCDataChannelMessage;
-        if (message.isBinary) return; // remote-control channel is text-only
-
-        final text = message.text;
-        try {
-          final parsed = jsonDecode(text) as Map<String, dynamic>;
-          if (parsed['type'] == 'mousemove' && parsed['seq'] != null) {
-            final seq = parsed['seq'] as int;
-            if (seq <= _lastMoveSeq) return;
-            _lastMoveSeq = seq;
-          }
-        } catch (_) {
-          // Malformed JSON - let Rust's serde report it rather than
-          // silently dropping, matching the original's forward-and-let-the-
-          // deserializer-fail behavior for non-mousemove parse issues.
-        }
-
-        injectInput(payloadJson: text).catchError((Object e) {
-          // ignore: avoid_print
-          print('[MediasoupSignaling] inject_input failed: $e');
-        });
-      });
-    };
     // No SctpStreamParameters.fromMap in the vendored library - built
     // manually. Real captured shape (see the earlier devtools capture) is
     // just {"streamId": 0, "ordered": false}.
     final sctpJson = params['sctpStreamParameters'] as Map<String, dynamic>;
+    final completer = Completer<void>();
     transport.consumeData(
       id: params['dataConsumerId'] as String,
       dataProducerId: params['dataProducerId'] as String,
@@ -599,6 +569,59 @@ class MediasoupSignaling {
       ),
       label: (params['label'] as String?) ?? 'remote-control',
       protocol: (params['protocol'] as String?) ?? '',
+      // Per-call callback (see Transport.consumeData()'s doc comment) - not
+      // a shared Transport.dataConsumerCallback field, so this call's own
+      // consumer can't be clobbered by a concurrent consumeKeyboardData()/
+      // consumeClipboardData() call on the same recv transport.
+      // dataConsumerCallback?.call(dataConsumer, accept) - transport.dart
+      // invokes it with 2 args (same MediaSFU-specific `accept` addition as
+      // consume()'s callback above); this crashed live with NoSuchMethodError
+      // until the second param was added.
+      callback: (dataConsumer, [accept]) {
+        _dataConsumer = dataConsumer as DataConsumer;
+        // ignore: avoid_print
+        print('[MediasoupSignaling] dataConsumer created: ${_dataConsumer!.id}');
+        // Payload shape confirmed from data_consumer.dart: {'data': RTCDataChannelMessage}.
+        // Forwards the raw JSON string straight through to Rust - same shape
+        // the reference Tauri app's input_inject.rs already deserializes with
+        // serde, no reformatting of the payload itself. The seq-discard check
+        // below is a forwarding decision, not a reformat.
+        _dataConsumer!.on('message', (event) {
+          final message = (event as Map)['data'] as RTCDataChannelMessage;
+          if (message.isBinary) return; // remote-control channel is text-only
+
+          final text = message.text;
+          try {
+            final parsed = jsonDecode(text) as Map<String, dynamic>;
+            if (parsed['type'] == 'mousemove' && parsed['seq'] != null) {
+              final seq = parsed['seq'] as int;
+              if (seq <= _lastMoveSeq) return;
+              _lastMoveSeq = seq;
+            }
+          } catch (_) {
+            // Malformed JSON - let Rust's serde report it rather than
+            // silently dropping, matching the original's forward-and-let-the-
+            // deserializer-fail behavior for non-mousemove parse issues.
+          }
+
+          injectInput(payloadJson: text).catchError((Object e) {
+            // ignore: avoid_print
+            print('[MediasoupSignaling] inject_input failed: $e');
+          });
+        });
+        if (!completer.isCompleted) completer.complete();
+      },
+    );
+    // Previously returned here without waiting for this call's own consumer
+    // to actually exist - the gap that made the shared-callback-field race
+    // (now closed by the per-call `callback:` above) practically reachable.
+    // Bounded so a genuinely stuck consumer fails loudly instead of hanging
+    // this call (and rebindDataConsumer()'s await of it) forever.
+    await completer.future.timeout(
+      produceTimeout,
+      onTimeout: () => throw StateError(
+        'consume-data: local ack timeout (dataConsumer never created)',
+      ),
     );
   }
 
@@ -627,26 +650,7 @@ class MediasoupSignaling {
     }
     await transport.handlerReady;
 
-    // Shares Transport.dataConsumerCallback with consumeData()/
-    // consumeClipboardData() above — see consumeClipboardData()'s doc
-    // comment for why this is safe (every caller awaits its own completer
-    // before returning, so calls never interleave in a way that would let
-    // one reassign this field before a prior call's queued task reads it).
     final completer = Completer<void>();
-    transport.dataConsumerCallback = (dataConsumer, [accept]) {
-      _keyboardDataConsumer = dataConsumer as DataConsumer;
-      // ignore: avoid_print
-      print('[MediasoupSignaling] keyboard dataConsumer created: ${_keyboardDataConsumer!.id}');
-      _keyboardDataConsumer!.on('message', (event) {
-        final message = (event as Map)['data'] as RTCDataChannelMessage;
-        if (message.isBinary) return;
-        injectInput(payloadJson: message.text).catchError((Object e) {
-          // ignore: avoid_print
-          print('[MediasoupSignaling] inject_input (keyboard channel) failed: $e');
-        });
-      });
-      if (!completer.isCompleted) completer.complete();
-    };
     final sctpJson = params['sctpStreamParameters'] as Map<String, dynamic>;
     transport.consumeData(
       id: params['dataConsumerId'] as String,
@@ -659,8 +663,31 @@ class MediasoupSignaling {
       ),
       label: (params['label'] as String?) ?? kKeyboardDataLabel,
       protocol: (params['protocol'] as String?) ?? '',
+      // Per-call callback - see consumeData()'s (input) identical comment
+      // above. This consumer's callback can no longer be clobbered by a
+      // concurrent consumeData()/consumeClipboardData() call on this same
+      // recv transport.
+      callback: (dataConsumer, [accept]) {
+        _keyboardDataConsumer = dataConsumer as DataConsumer;
+        // ignore: avoid_print
+        print('[MediasoupSignaling] keyboard dataConsumer created: ${_keyboardDataConsumer!.id}');
+        _keyboardDataConsumer!.on('message', (event) {
+          final message = (event as Map)['data'] as RTCDataChannelMessage;
+          if (message.isBinary) return;
+          injectInput(payloadJson: message.text).catchError((Object e) {
+            // ignore: avoid_print
+            print('[MediasoupSignaling] inject_input (keyboard channel) failed: $e');
+          });
+        });
+        if (!completer.isCompleted) completer.complete();
+      },
     );
-    await completer.future;
+    await completer.future.timeout(
+      produceTimeout,
+      onTimeout: () => throw StateError(
+        'consume-data (keyboard): local ack timeout (dataConsumer never created)',
+      ),
+    );
   }
 
   /// Closes and replaces the keyboard consumer — same "different agent takes
@@ -711,12 +738,6 @@ class MediasoupSignaling {
     await transport.handlerReady;
 
     final completer = Completer<void>();
-    transport.dataProducerCallback = (dataProducer) {
-      _clipboardDataProducer = dataProducer as DataProducer;
-      // ignore: avoid_print
-      print('[MediasoupSignaling] clipboard dataProducer created: ${_clipboardDataProducer!.id}, readyState=${_clipboardDataProducer!.readyState}');
-      if (!completer.isCompleted) completer.complete();
-    };
     // ordered:true + a generous maxRetransmits is the closest this vendored
     // fork's produceData() can express to "fully reliable" - its public
     // signature requires a concrete int (transport.dart's `required int
@@ -729,6 +750,14 @@ class MediasoupSignaling {
       ordered: true,
       maxRetransmits: 30,
       label: kClipboardDataLabel,
+      // Per-call callback (see Transport.produceData()'s doc comment) - not
+      // a shared Transport.dataProducerCallback field.
+      callback: (dataProducer) {
+        _clipboardDataProducer = dataProducer as DataProducer;
+        // ignore: avoid_print
+        print('[MediasoupSignaling] clipboard dataProducer created: ${_clipboardDataProducer!.id}, readyState=${_clipboardDataProducer!.readyState}');
+        if (!completer.isCompleted) completer.complete();
+      },
     );
     await completer.future.timeout(
       produceTimeout,
@@ -746,11 +775,22 @@ class MediasoupSignaling {
   /// unlike the input data channel (which has never needed this - it's
   /// created early, well before anything is sent on it).
   Future<void> _waitForDataProducerOpen(DataProducer producer) async {
+    // ignore: avoid_print
+    print('[MediasoupSignaling] clipboard dataProducer readyState at wait-entry: ${producer.readyState}');
     if (producer.readyState == RTCDataChannelState.RTCDataChannelOpen) {
       return;
     }
     // ignore: avoid_print
     print('[MediasoupSignaling] clipboard dataProducer not yet open (readyState=${producer.readyState}) — waiting');
+    // DIAGNOSTIC (see decision.md, repeat-clipboard-push bug): ask the NATIVE
+    // layer what it thinks this channel's state is, independently of Dart's
+    // own cached mirror. dataChannelGetBufferedAmount is the one method
+    // channel that gates on the real native readyState (it errors unless the
+    // channel is genuinely open), so it doubles as an oracle for "Dart's
+    // mirror disagrees with reality". If this reports OPEN while readyState
+    // is still null, the channel is fine and only the Dart-side state
+    // notification was lost.
+    unawaited(_probeNativeDataChannelState(producer.dataChannel));
     final completer = Completer<void>();
     // once(), not on() — self-removes after firing, so there's no listener
     // to leak and no risk of a manual off('open') clobbering some other
@@ -768,6 +808,29 @@ class MediasoupSignaling {
     );
     // ignore: avoid_print
     print('[MediasoupSignaling] clipboard dataProducer now open');
+  }
+
+  /// Diagnostic only — see the call site in [_waitForDataProducerOpen].
+  /// Never throws; purely logs whether the native side considers this channel
+  /// open at a moment when the Dart side does not.
+  Future<void> _probeNativeDataChannelState(RTCDataChannel channel) async {
+    try {
+      final amount = await channel.getBufferedAmount();
+      // ignore: avoid_print
+      print(
+        '[MediasoupSignaling] NATIVE-PROBE: channel is OPEN natively '
+        '(bufferedAmount=$amount) while Dart readyState reports '
+        '${channel.state} — the Dart-side mirror is stale, the channel '
+        'itself is fine',
+      );
+    } catch (e) {
+      // ignore: avoid_print
+      print(
+        '[MediasoupSignaling] NATIVE-PROBE: native side ALSO reports not-open '
+        '($e) — this is a real transport-level failure, not a lost '
+        'state notification',
+      );
+    }
   }
 
   /// Sends `text` over this customer's already-open clipboard producer.
@@ -815,23 +878,6 @@ class MediasoupSignaling {
     _clipboardDataConsumer = null;
 
     final completer = Completer<void>();
-    // Shares Transport.dataConsumerCallback with consumeData() (input) above
-    // — a single field on the vendored library's Transport, not a
-    // multi-listener event. Safe here because every caller of either
-    // consumeData-family method awaits its own completer before returning,
-    // so in normal operation there is no window where a second call
-    // reassigns this field before the first call's queued task has already
-    // read and invoked it (see Transport.consumeData()'s _flexQueue).
-    transport.dataConsumerCallback = (dataConsumer, [accept]) {
-      _clipboardDataConsumer = dataConsumer as DataConsumer;
-      // ignore: avoid_print
-      print('[MediasoupSignaling] clipboard dataConsumer created: ${_clipboardDataConsumer!.id}');
-      _clipboardDataConsumer!.on('message', (event) {
-        final message = (event as Map)['data'] as RTCDataChannelMessage;
-        unawaited(_handleClipboardMessage(message));
-      });
-      if (!completer.isCompleted) completer.complete();
-    };
     final sctpJson = params['sctpStreamParameters'] as Map<String, dynamic>;
     transport.consumeData(
       id: params['dataConsumerId'] as String,
@@ -844,8 +890,37 @@ class MediasoupSignaling {
       ),
       label: (params['label'] as String?) ?? kClipboardDataLabel,
       protocol: (params['protocol'] as String?) ?? '',
+      // Per-call callback (see consumeData()'s (input) identical comment) -
+      // not a shared Transport.dataConsumerCallback field, so this consumer
+      // can no longer be clobbered by a concurrent consumeData()/
+      // consumeKeyboardData() call on this same recv transport. This was
+      // the confirmed root cause of "Paste to Customer" failing with
+      // "clipboard temporarily unavailable" - the callback below could be
+      // silently stolen by an overlapping consume call, leaving the
+      // completer below unresolved forever (previously with no timeout at
+      // all - see the timeout added below).
+      callback: (dataConsumer, [accept]) {
+        _clipboardDataConsumer = dataConsumer as DataConsumer;
+        // ignore: avoid_print
+        print('[MediasoupSignaling] clipboard dataConsumer created: ${_clipboardDataConsumer!.id}');
+        _clipboardDataConsumer!.on('message', (event) {
+          final message = (event as Map)['data'] as RTCDataChannelMessage;
+          unawaited(_handleClipboardMessage(message));
+        });
+        if (!completer.isCompleted) completer.complete();
+      },
     );
-    await completer.future;
+    // Previously an unbounded `await completer.future;` - the one wait in
+    // this file with no timeout. If the callback above were ever not
+    // invoked (the race this per-call callback now prevents, or any other
+    // future cause), this hung forever with zero error. Now bounded and
+    // fails loudly, matching every other wait in this file.
+    await completer.future.timeout(
+      produceTimeout,
+      onTimeout: () => throw StateError(
+        'consume-data (clipboard): local ack timeout (dataConsumer never created)',
+      ),
+    );
 
     // consumeData()'s completer resolving confirms the DataConsumer object/
     // local negotiation, not that its RTCDataChannel has actually finished
