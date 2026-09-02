@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File;
+import 'dart:io' show File, Platform;
 import 'dart:typed_data' show Uint8List;
 
 import 'package:collection/collection.dart';
@@ -1160,6 +1160,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
       // somehow isn't loaded (it always is by accept time).
       'rtpCapabilities':
           _signaling.device?.rtpCapabilities.toMap() ?? routerRtpCapabilitiesJson,
+      // Lets the agent know when a session is cross-platform (informational
+      // dialog + opt-in Ctrl/Cmd shortcut translation toggle) — 'macos'/
+      // 'windows'/'linux', same vocabulary Tauri's plugin-os reports on the
+      // agent side, no translation table needed between the two apps.
+      'customerOs': Platform.operatingSystem,
     });
     _setPhase(_Phase.sessionIncoming, 'Session accepted — setting up transports…');
   }
