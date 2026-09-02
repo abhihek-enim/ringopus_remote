@@ -43,6 +43,8 @@ class ProduceArguments {
   final bool zeroRtpOnPause;
   final Map<String, dynamic> appData;
   final String source;
+  // Per-call callback — see produce()'s `callback` param doc comment.
+  final Function? callback;
 
   const ProduceArguments({
     required this.track,
@@ -55,6 +57,7 @@ class ProduceArguments {
     this.zeroRtpOnPause = false,
     this.appData = const <String, dynamic>{},
     required this.source,
+    this.callback,
   });
 }
 
@@ -66,6 +69,8 @@ class ConsumeArguments {
   final Map<String, dynamic> appData;
   final Function? accept;
   final String peerId;
+  // Per-call callback — see consume()'s `callback` param doc comment.
+  final Function? callback;
 
   const ConsumeArguments({
     required this.id,
@@ -75,6 +80,7 @@ class ConsumeArguments {
     required this.appData,
     this.accept,
     required this.peerId,
+    this.callback,
   });
 }
 
@@ -456,6 +462,18 @@ class Transport extends EnhancedEventEmitter {
   // Observer instance.
   final EnhancedEventEmitter _observer = EnhancedEventEmitter();
 
+  // Legacy shared-state callbacks, read at FlexQueue task EXECUTION time (not
+  // call time) by produce()/consume()/produceData()/consumeData() when no
+  // per-call `callback` argument is given. Unsafe whenever more than one
+  // produce/consume call on this Transport can be outstanding at once — a
+  // later call reassigning these fields can clobber an earlier call's
+  // callback before that earlier call's queued task has run, silently
+  // losing its result (a real, confirmed bug on the recv side, where
+  // multiple DataConsumers — input, keyboard, clipboard — share one
+  // Transport). Kept only for source compatibility (device.dart still
+  // threads them through constructors). New call sites should always pass
+  // `callback:` directly to produce()/consume()/produceData()/consumeData()
+  // instead of relying on these.
   Function? producerCallback;
   Function? consumerCallback;
   Function? dataProducerCallback;
@@ -913,7 +931,7 @@ class Transport extends EnhancedEventEmitter {
         // Emit observer event.
         _observer.safeEmit('newProducer', {'producer': producer});
 
-        producerCallback?.call(producer);
+        (arguments.callback ?? producerCallback)?.call(producer);
       } catch (error) {
         _handler.stopSending(sendResult.localId);
 
@@ -944,6 +962,12 @@ class Transport extends EnhancedEventEmitter {
     bool zeroRtpOnPause = false,
     Map<String, dynamic> appData = const <String, dynamic>{},
     required String source,
+    // Per-call callback — see produceData()'s `callback` param doc comment
+    // (transport.dart, same file) for the identical mechanism/rationale.
+    // Only one live caller exists today (mediasoup_signaling.dart's own
+    // produce()), so this isn't fixing an observed bug — it closes the same
+    // shared-field footgun before a second caller ever needs to exist.
+    Function? callback,
   }) {
     _logger.debug('produce() [track:${track.toString()}');
 
@@ -976,6 +1000,7 @@ class Transport extends EnhancedEventEmitter {
           zeroRtpOnPause: zeroRtpOnPause,
           appData: appData,
           source: source,
+          callback: callback,
         ),
       ),
     );
@@ -1045,7 +1070,7 @@ class Transport extends EnhancedEventEmitter {
     // Emit observer event.
     _observer.safeEmit('newconsumer', {'consumer': consumer});
 
-    consumerCallback?.call(consumer, arguments.accept);
+    (arguments.callback ?? consumerCallback)?.call(consumer, arguments.accept);
   }
 
   /// Create a Consumer to consume a remote Producer.
@@ -1058,6 +1083,11 @@ class Transport extends EnhancedEventEmitter {
     required RtpParameters rtpParameters,
     Map<String, dynamic> appData = const <String, dynamic>{},
     Function? accept,
+    // Per-call callback — see produceData()'s `callback` param doc comment
+    // for the identical mechanism/rationale. No live caller of this method
+    // exists in this app today; added for consistency with produce()/
+    // produceData()/consumeData() rather than fixing an observed bug here.
+    Function? callback,
   }) {
     _logger.debug('consume()');
 
@@ -1087,6 +1117,7 @@ class Transport extends EnhancedEventEmitter {
           appData: appData,
           accept: accept,
           peerId: peerId,
+          callback: callback,
         ),
       ),
     );
@@ -1102,6 +1133,15 @@ class Transport extends EnhancedEventEmitter {
     String label = '',
     String protocol = '',
     Map<String, dynamic> appData = const <String, dynamic>{},
+    // Per-call callback, invoked with the new DataProducer once THIS call's
+    // own queued task actually runs. Captured into `onDataProducer` below,
+    // synchronously, at call time — before the task is even enqueued — so a
+    // later, overlapping produceData() call reassigning `dataProducerCallback`
+    // can never steal this call's callback out from under it. Prefer this
+    // over the legacy `dataProducerCallback` field for any caller that might
+    // overlap with another produceData()/consumeData() call on this
+    // Transport — see that field's own doc comment for the race it has.
+    Function? callback,
   }) {
     _logger.debug('produceData()');
 
@@ -1119,6 +1159,10 @@ class Transport extends EnhancedEventEmitter {
     if (maxPacketLife != 0 || maxRetransmits != 0) {
       ordered = false;
     }
+
+    // Captured NOW, not read from `this.dataProducerCallback` inside the
+    // closure below — see the `callback` param doc comment above.
+    final Function? onDataProducer = callback ?? dataProducerCallback;
 
     // Enqueue command.
     _flexQueue.addTask(
@@ -1162,7 +1206,7 @@ class Transport extends EnhancedEventEmitter {
           // Emit observer event.
           _observer.safeEmit('newdataproducer', {'dataProducer': dataProducer});
 
-          dataProducerCallback?.call(dataProducer);
+          onDataProducer?.call(dataProducer);
         },
       ),
     );
@@ -1179,6 +1223,10 @@ class Transport extends EnhancedEventEmitter {
     Map<String, dynamic> appData = const <String, dynamic>{},
     String? peerId,
     Function? accept,
+    // Per-call callback — see produceData()'s `callback` param doc comment
+    // above, identical mechanism. Invoked with (DataConsumer dataConsumer,
+    // [Function? accept]) once this call's own queued task actually runs.
+    Function? callback,
   }) {
     _logger.debug('consumeData()');
 
@@ -1196,6 +1244,9 @@ class Transport extends EnhancedEventEmitter {
 
     // This may throw.
     Ortc.validateAndNormalizeSctpStreamParameters(sctpStreamParameters);
+
+    // Captured NOW — see produceData()'s identical comment.
+    final Function? onDataConsumer = callback ?? dataConsumerCallback;
 
     // Enqueue command.
     _flexQueue.addTask(
@@ -1227,7 +1278,7 @@ class Transport extends EnhancedEventEmitter {
           // Emit observer event.
           _observer.safeEmit('newdataconsumer', {'dataConsumer': dataConsumer});
 
-          dataConsumerCallback?.call(dataConsumer, accept);
+          onDataConsumer?.call(dataConsumer, accept);
         },
       ),
     );
