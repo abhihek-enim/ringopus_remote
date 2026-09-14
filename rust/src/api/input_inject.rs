@@ -288,6 +288,38 @@ fn injector_loop(rx: Receiver<InputEvent>) {
     }
 }
 
+/// Maps a 0..1 normalized coordinate from the agent's canvas onto a real pixel
+/// column/row of this screen.
+///
+/// Two things this does that the original `(norm * extent) as i32` did not, and
+/// both are needed before the customer's screen edge is reachable at all:
+///
+///   * Maps onto `0..=extent-1`, not `0..extent`. `extent` itself is one past
+///     the last addressable pixel.
+///   * Rounds instead of truncating. Truncation meant the outermost column of a
+///     1920-wide screen needed `norm >= 0.999479` — the final half CSS pixel of
+///     the agent's canvas — so an agent dragging to the edge of their view
+///     landed one or more pixels INSIDE the customer's screen. Everything macOS
+///     and Windows trigger on genuine edge contact stayed dead: an auto-hidden
+///     Dock on any edge, hot corners, the menu bar, Windows' screen-edge snap.
+///
+/// Reported 2026-09-14 against a customer whose Dock sat on the right edge.
+/// The agent side (inputListeners.ts) additionally snaps near-edge pointer
+/// positions to exactly 0.0/1.0 and sends an unthrottled sample as the pointer
+/// leaves the canvas; this function is what makes those land on the real pixel.
+fn to_pixel(norm: f64, extent: i32) -> i32 {
+    if extent <= 1 {
+        return 0;
+    }
+    let max = (extent - 1) as f64;
+    // `norm` is remote input. It arrives clamped from our own agent, but clamp
+    // again rather than trusting a peer to keep the pointer on the screen.
+    if !norm.is_finite() {
+        return 0;
+    }
+    (norm * max).round().clamp(0.0, max) as i32
+}
+
 fn handle_event(enigo: &mut Enigo, payload: InputEvent) -> Result<(), String> {
     if !INJECTION_ARMED.load(Ordering::SeqCst) {
         return Ok(());
@@ -295,16 +327,16 @@ fn handle_event(enigo: &mut Enigo, payload: InputEvent) -> Result<(), String> {
     match payload.event_type.as_str() {
         "mousemove" => {
             let (screen_w, screen_h) = enigo.main_display().map_err(|e| e.to_string())?;
-            let x = (payload.x.unwrap_or(0.0) * screen_w as f64) as i32;
-            let y = (payload.y.unwrap_or(0.0) * screen_h as f64) as i32;
+            let x = to_pixel(payload.x.unwrap_or(0.0), screen_w);
+            let y = to_pixel(payload.y.unwrap_or(0.0), screen_h);
             enigo
                 .move_mouse(x, y, Coordinate::Abs)
                 .map_err(|e| e.to_string())?;
         }
         "mousedown" | "mouseup" => {
             let (screen_w, screen_h) = enigo.main_display().map_err(|e| e.to_string())?;
-            let x = (payload.x.unwrap_or(0.0) * screen_w as f64) as i32;
-            let y = (payload.y.unwrap_or(0.0) * screen_h as f64) as i32;
+            let x = to_pixel(payload.x.unwrap_or(0.0), screen_w);
+            let y = to_pixel(payload.y.unwrap_or(0.0), screen_h);
             enigo
                 .move_mouse(x, y, Coordinate::Abs)
                 .map_err(|e| e.to_string())?;
@@ -482,4 +514,49 @@ pub fn inject_input(payload_json: String) -> Result<(), String> {
         return Err(msg);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_pixel;
+
+    // The whole point of the change: norm 1.0 must reach the LAST pixel, not
+    // one past it and not one short of it. 1919, on a 1920-wide screen, is the
+    // column an auto-hidden right-hand Dock lives behind.
+    #[test]
+    fn maps_the_far_edge_onto_the_last_pixel() {
+        assert_eq!(to_pixel(1.0, 1920), 1919);
+        assert_eq!(to_pixel(0.0, 1920), 0);
+        assert_eq!(to_pixel(1.0, 1080), 1079);
+        assert_eq!(to_pixel(0.0, 1080), 0);
+    }
+
+    // The old `(norm * extent) as i32` truncated, so 0.999 landed on 1918 and
+    // the edge behaviour never fired. Rounding is what closes that last pixel.
+    #[test]
+    fn rounds_rather_than_truncating() {
+        assert_eq!(to_pixel(0.999, 1920), 1917); // 0.999 * 1919 = 1917.08
+        assert_eq!((0.999_f64 * 1920.0) as i32, 1918); // what it used to do
+        assert_eq!(to_pixel(0.5, 1921), 960);
+    }
+
+    // Remote input, so out-of-range and non-finite values must be contained
+    // here rather than reaching enigo.
+    #[test]
+    fn clamps_hostile_input() {
+        assert_eq!(to_pixel(1.5, 1920), 1919);
+        assert_eq!(to_pixel(-0.5, 1920), 0);
+        assert_eq!(to_pixel(f64::NAN, 1920), 0);
+        assert_eq!(to_pixel(f64::INFINITY, 1920), 0);
+    }
+
+    // A 1px or 0px display is not a real configuration, but main_display() is
+    // an OS call and this must not produce a negative coordinate if it ever
+    // returns something degenerate.
+    #[test]
+    fn degenerate_extents_are_safe() {
+        assert_eq!(to_pixel(1.0, 1), 0);
+        assert_eq!(to_pixel(1.0, 0), 0);
+        assert_eq!(to_pixel(1.0, -5), 0);
+    }
 }
