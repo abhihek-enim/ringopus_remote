@@ -148,7 +148,7 @@ const Duration _mediasoupReconnectWindow = Duration(seconds: 30); // overall giv
 // budget; the server holds the session ~45s (a longer backstop) either way.
 const Duration _xmppUnrecoverableWindow = Duration(seconds: 30);
 
-class _ProducerHomePageState extends State<ProducerHomePage> {
+class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener {
   final _jidController = TextEditingController();
   final _passwordController = TextEditingController();
   final RTCVideoRenderer _renderer = RTCVideoRenderer();
@@ -315,6 +315,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
   @override
   void initState() {
     super.initState();
+    // Minimizing while sharing silently kills remote input — see
+    // onWindowMinimize below for the mechanism. This listener is the backstop
+    // for the routes that bypass the disabled minimize button.
+    windowManager.addListener(this);
     _renderer.initialize();
     _signaling.onTransportStateChanged = _onMediasoupStateChanged;
     _signaling.onClipboardPasteResult = _onClipboardPasteResult;
@@ -355,6 +359,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
 
   @override
   void dispose() {
+    windowManager.removeListener(this);
     // _teardownSession is async and dispose() can't await it, so it's fired
     // unawaited - but _stopSharingLocally() (called first inside it) starts
     // executing synchronously up to its own first `await`, which includes
@@ -1244,6 +1249,19 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     await windowManager.setSize(_dockedSize);
     await windowManager.setAlignment(Alignment.bottomRight);
     await windowManager.setAlwaysOnTop(true);
+    // Minimizing mid-session freezes remote input until the customer happens
+    // to move their own mouse — see onWindowMinimize for why. Disabling the
+    // button greys it out, so an agent who reaches for it can SEE it is
+    // unavailable rather than clicking a control that appears to do nothing.
+    //
+    // Wrapped because this is the only call here that some platforms may not
+    // implement: failing to disable a button must never fail the dock, which
+    // would leave a full-size window sitting over the customer's screen.
+    try {
+      await windowManager.setMinimizable(false);
+    } catch (e) {
+      _appendLog('[window] could not disable minimize: $e');
+    }
     if (mounted) setState(() {});
   }
 
@@ -1253,10 +1271,56 @@ class _ProducerHomePageState extends State<ProducerHomePage> {
     final bounds = _preDockBounds;
     if (bounds == null) return;
     _preDockBounds = null;
+    // Restored first, and unconditionally: leaving a window that cannot be
+    // minimized after the session has ended is worse than the bug this
+    // prevents, and this path runs from every teardown route including
+    // failures.
+    try {
+      await windowManager.setMinimizable(true);
+    } catch (_) {
+      // Nothing to do — the window is about to be restored to full size and
+      // its own controls anyway.
+    }
     await windowManager.setAlwaysOnTop(false);
     await windowManager.setResizable(true);
     await windowManager.setBounds(bounds);
     if (mounted) setState(() {});
+  }
+
+  /// Undoes a minimize that happened anyway, while a session is live.
+  ///
+  /// Remote input reaches this app over a data channel whose messages are
+  /// delivered to a **Dart** callback, which then hands them to the Rust
+  /// injector (see MediasoupSignaling's consumeData). Windows throttles a
+  /// Flutter app's message pump while its window is minimized, so that Dart
+  /// hop stops running: the events still arrive over the network and queue up,
+  /// but nothing injects them. The session looks frozen — video keeps flowing,
+  /// because capture is getDisplayMedia at the screen level and does not care
+  /// about our window — until the customer moves their own mouse, which pumps
+  /// the loop and flushes the backlog at once.
+  ///
+  /// setMinimizable(false) in _dockToCorner stops the minimize BUTTON, which is
+  /// the reported route (an agent clicking it remotely). It cannot stop Win+D,
+  /// "show desktop", or a taskbar click, so this catches those.
+  ///
+  /// The minimize itself pumps the loop, which is what gives this callback its
+  /// chance to run before the pump goes quiet.
+  @override
+  void onWindowMinimize() {
+    if (_phase != _Phase.sharing) return;
+    unawaited(() async {
+      try {
+        await windowManager.restore();
+        // Docking sets the size and corner; restore() alone can come back at
+        // the pre-dock size, which would put a large window over the very
+        // screen the agent is working on.
+        await windowManager.setSize(_dockedSize);
+        await windowManager.setAlignment(Alignment.bottomRight);
+        await windowManager.setAlwaysOnTop(true);
+      } catch (e) {
+        _appendLog('[window] could not restore after minimize: $e');
+      }
+    }());
   }
 
   Future<void> _startCapture() async {
