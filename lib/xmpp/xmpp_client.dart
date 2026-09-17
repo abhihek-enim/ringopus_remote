@@ -31,7 +31,9 @@ const String ejabberdWsHost = '149.28.128.203';
 /// are load-bearing, not incidental - see the doc comments on each.
 class XmppClient {
   XmppClient(String jid, String password)
-    : _whixp = Whixp(
+    : _jidArg = jid,
+      _passwordArg = password,
+      _whixp = Whixp(
         jabberID: jid,
         password: password,
         // Actual TCP/WebSocket connection target - see ejabberdWsHost above.
@@ -55,6 +57,14 @@ class XmppClient {
   XmppClient.guest() : this(guestVhost, '');
 
   final Whixp _whixp;
+  final String _jidArg;
+  final String _passwordArg;
+
+  /// A brand-new client with the same credentials, for replacing a connection
+  /// that has died without whixp noticing (see producer_home_page.dart's XMPP
+  /// liveness probe). Abort this one first: the native transport must never
+  /// carry two live connections at once (decision.md, 2026-08-26).
+  XmppClient recreate() => XmppClient(_jidArg, _passwordArg);
 
   void Function(String jid)? onConnected;
   void Function()? onAuthFailed;
@@ -140,6 +150,12 @@ class XmppClient {
   void connect() => _whixp.connect();
 
   void disconnect() => _whixp.disconnect();
+
+  /// Drops the connection at once, without sending a stream footer or waiting
+  /// for the server — for a socket already known to be dead, where a graceful
+  /// close would only wait on a peer that cannot answer. Also stops whixp's
+  /// own reconnection attempts for this instance.
+  Future<void> abort() => _whixp.disconnect(consume: false);
 
   String get jid => _whixp.transport.boundJID?.bare ?? '';
 }

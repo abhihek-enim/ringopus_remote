@@ -80,6 +80,20 @@ class _ConnectPending {
 /// agnostic by design (matches the reference): callers wire [sendToComponent]
 /// and feed incoming component messages into [resolveConnect]/
 /// [resolveProduce]/[resolveProduceData] themselves.
+// Keep gathering ICE candidates for the life of the transport, instead of
+// once at creation. When the network goes away and comes back (a wifi
+// toggle), libwebrtc then gathers on the returning interface by itself and
+// re-pairs with the server's unchanged candidate — mediasoup accepts a
+// returning client from any new address (IceServer, 'disconnected' ->
+// 'connected'). Media recovers with no signaling at all, so it no longer
+// waits on XMPP, which can take far longer to notice a dead socket
+// (2026-09-17 live test: two sessions never recovered for exactly that
+// reason). Parsed by the macOS/iOS binding (FlutterWebRTCPlugin.m); the
+// Windows C++ binding ignores it, and Windows relies on restart-ice instead.
+const Map<String, dynamic> _kIceRecoverySettings = {
+  'continualGatheringPolicy': 'gather_continually',
+};
+
 class MediasoupSignaling {
   Device? _device;
   Transport? _sendTransport;
@@ -193,6 +207,7 @@ class MediasoupSignaling {
       // TURN relay (server-issued; empty list = direct-only, as before).
       iceServers: _parseIceServers(iceServers),
       iceTransportPolicy: _kForceTurnRelay ? RTCIceTransportPolicy.relay : null,
+      additionalSettings: _kIceRecoverySettings,
     );
     _sendTransport = transport;
     // ignore: avoid_print
@@ -299,6 +314,7 @@ class MediasoupSignaling {
       // TURN relay (server-issued; empty list = direct-only, as before).
       iceServers: _parseIceServers(iceServers),
       iceTransportPolicy: _kForceTurnRelay ? RTCIceTransportPolicy.relay : null,
+      additionalSettings: _kIceRecoverySettings,
     );
     _recvTransport = transport;
     // ignore: avoid_print

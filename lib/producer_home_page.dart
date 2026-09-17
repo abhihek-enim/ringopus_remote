@@ -314,6 +314,19 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   final Set<String> _mediasoupNeedingRecovery = {}; // labels ('send'/'recv') currently dropped and being recovered
   Timer? _mediasoupReconnectDeadline; // single overall give-up timer for the whole reconnect episode
 
+  // XMPP liveness during a session (2026-09-17). whixp's keepalive is an SM
+  // <r/> every 30s with no timeout, so a connection whose network vanished
+  // (wifi off) looks connected forever: in the first live test ejabberd gave
+  // up on the socket after ~70s while this app kept writing restart-ice into
+  // it, and the session was lost. The probe asks the server a question
+  // (session-sync → session-state) whenever it has been quiet, and replaces
+  // the connection when no answer comes back.
+  Timer? _xmppLivenessTimer;
+  DateTime _lastComponentMessageAt = DateTime.now();
+  DateTime? _xmppProbeSentAt; // an unanswered session-sync is outstanding
+  DateTime? _xmppDownSince; // whixp itself reports the connection down
+  bool _xmppReplacing = false;
+
   @override
   void initState() {
     super.initState();
@@ -826,7 +839,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     xmpp.onComponentMessage = _onComponentMessage;
     xmpp.onStateChanged = _onXmppStateChanged;
     xmpp.connect();
-    _setPhase(_Phase.connecting, 'Connecting…');
+    // A replacement connection mid-session must not pull the app out of it.
+    if (!_sessionInProgress) _setPhase(_Phase.connecting, 'Connecting…');
   }
 
   bool get _sessionInProgress =>
@@ -838,6 +852,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   /// (session-sync → session-state, or session-terminated if it ended), and
   /// let any ICE restart that was waiting on XMPP go out now.
   void _onXmppStreamRestored() {
+    _xmppDownSince = null;
+    _xmppProbeSentAt = null;
+    _lastComponentMessageAt = DateTime.now();
     _xmppUnrecoverableTimer?.cancel();
     _xmppUnrecoverableTimer = null;
     if (_xmppReconnecting && mounted) setState(() => _xmppReconnecting = false);
@@ -867,6 +884,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   }
 
   Future<void> _onComponentMessage(Map<String, dynamic> msg) async {
+    _lastComponentMessageAt = DateTime.now(); // any reply proves the connection is alive
     switch (msg['type']) {
       case 'router-rtp-capabilities':
         await _signaling.loadDevice(msg['rtpCapabilities'] as Map<String, dynamic>);
@@ -915,7 +933,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
           return;
         }
         _signaling.sid = sid;
-        _signaling.sendToComponent = _xmpp!.sendToComponent;
+        // Through _xmpp, not a tear-off of the current client: the liveness
+        // probe may replace that client mid-session.
+        _signaling.sendToComponent = (m) => _xmpp?.sendToComponent(m);
+        _startXmppLivenessProbe();
         // Re-arm the teardown choke point here, at the actual start of a new
         // session — not only deep inside _startCapture()'s success path
         // (still done there too, as a second, harmless layer). A session
@@ -1578,6 +1599,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   };
 
   void _cancelAllDropTimers() {
+    _xmppLivenessTimer?.cancel();
+    _xmppLivenessTimer = null;
+    _xmppProbeSentAt = null;
     _xmppUnrecoverableTimer?.cancel();
     _xmppUnrecoverableTimer = null;
     _mediasoupReconnectDeadline?.cancel();
@@ -1698,6 +1722,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
         // already self-heal brief blips with zero app involvement; only
         // escalate if this drags on past the grace window below.
         _xmppConnected = false;
+        _xmppDownSince ??= DateTime.now();
         if (_xmppUnrecoverableTimer == null && _sessionInProgress) {
           if (mounted) setState(() => _xmppReconnecting = true);
           _xmppUnrecoverableTimer = Timer(_sessionReconnectBackstop, _declareXmppUnrecoverable);
@@ -1705,6 +1730,88 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
       default:
       // pickingAddress/connecting/tlsSuccess/killed/terminated - no action.
     }
+  }
+
+  // --- XMPP liveness probe (see _xmppLivenessTimer) ------------------------
+
+  static const Duration _xmppProbeTick = Duration(seconds: 2);
+  // Ask when the server has been quiet this long: often while our own media is
+  // down (the network is suspect), rarely otherwise.
+  static const Duration _xmppProbeQuietUrgent = Duration(seconds: 4);
+  static const Duration _xmppProbeQuietIdle = Duration(seconds: 30);
+  // No answer within this long means the connection is dead.
+  static const Duration _xmppProbeReplyTimeout = Duration(seconds: 8);
+  // whixp reporting "down" this long without reconnecting counts as stuck.
+  static const Duration _xmppStuckReconnectWindow = Duration(seconds: 20);
+
+  void _startXmppLivenessProbe() {
+    _xmppLivenessTimer?.cancel();
+    _xmppProbeSentAt = null;
+    _lastComponentMessageAt = DateTime.now();
+    _xmppLivenessTimer = Timer.periodic(_xmppProbeTick, (_) => _checkXmppLiveness());
+  }
+
+  void _checkXmppLiveness() {
+    if (_tearingDown || !_sessionInProgress || _xmppReplacing) return;
+    final now = DateTime.now();
+
+    if (!_xmppConnected) {
+      // whixp knows it is down and retries every 3s; step in only if that has
+      // not worked for a while (a network back for some time by then).
+      final downSince = _xmppDownSince;
+      if (downSince != null && now.difference(downSince) >= _xmppStuckReconnectWindow) {
+        unawaited(_replaceXmppConnection('still not reconnected after ${now.difference(downSince).inSeconds}s'));
+      }
+      return;
+    }
+
+    final probe = _xmppProbeSentAt;
+    if (probe != null) {
+      if (_lastComponentMessageAt.isAfter(probe)) {
+        _xmppProbeSentAt = null; // answered
+      } else if (now.difference(probe) >= _xmppProbeReplyTimeout) {
+        unawaited(_replaceXmppConnection('no answer from the server for ${now.difference(probe).inSeconds}s'));
+        return;
+      } else {
+        return; // still waiting for the answer
+      }
+    }
+
+    final quiet = _mediasoupNeedingRecovery.isNotEmpty ? _xmppProbeQuietUrgent : _xmppProbeQuietIdle;
+    if (now.difference(_lastComponentMessageAt) < quiet) return;
+    _xmppProbeSentAt = now;
+    _xmpp?.sendToComponent({'type': 'session-sync', 'sid': _signaling.sid});
+  }
+
+  /// Throws away a connection that is dead but not closed, and connects a new
+  /// one with the same identity. The old one is aborted first — the native
+  /// transport must never carry two connections at once. The session is
+  /// untouched: its media lives outside XMPP, and _onXmppStreamRestored
+  /// (via onConnected) re-syncs it once the new connection is up.
+  Future<void> _replaceXmppConnection(String why) async {
+    final old = _xmpp;
+    if (old == null || _xmppReplacing || _tearingDown) return;
+    _xmppReplacing = true;
+    _appendLog('[xmpp] $why — replacing the connection');
+    _xmppProbeSentAt = null;
+    _xmppConnected = false;
+    _xmppDownSince = DateTime.now();
+    if (mounted) setState(() => _xmppReconnecting = true);
+    old.onConnected = null;
+    old.onAuthFailed = null;
+    old.onComponentMessage = null;
+    old.onStateChanged = null;
+    try {
+      await old.abort();
+    } catch (e) {
+      _appendLog('[xmpp] abort of the old connection failed: $e');
+    }
+    if (_tearingDown || _xmpp != old) {
+      _xmppReplacing = false;
+      return;
+    }
+    _startXmpp(old.recreate());
+    _xmppReplacing = false;
   }
 
   void _declareXmppUnrecoverable() {
