@@ -1,13 +1,10 @@
 import 'package:flutter/services.dart';
 
-/// Dart-side handle for [PermissionsPlugin.swift] - requests the macOS
-/// Accessibility (input injection) and Screen Recording permissions
-/// together, up front, instead of letting each one get triggered lazily
-/// and separately mid-session (getDisplayMedia triggers Screen Recording;
-/// the first enigo event triggers Accessibility).
-///
-/// Safe to call on every session start: once a permission is granted (or
-/// denied), the underlying macOS calls are no-ops with no dialog shown.
+/// Thin Dart side of macos/Runner/PermissionsPlugin.swift - the two macOS
+/// system permissions a remote-control session needs (Accessibility for input
+/// injection, Screen Recording for capture). Every call is a safe no-op
+/// (returns "granted"/false as noted) on platforms without the plugin, so
+/// callers need no platform checks of their own beyond what the UI wants.
 class SessionPermissions {
   static const _channel = MethodChannel('com.oojack.app/permissions');
 
@@ -21,9 +18,8 @@ class SessionPermissions {
     }
   }
 
-  /// Best-effort status check - not required for requestBoth() to work,
-  /// but useful if the UI ever wants to show "permissions needed" state
-  /// before the user hits start.
+  /// Current status: `{'accessibility': bool, 'screenCapture': bool}`.
+  /// Empty map where the plugin does not exist (non-macOS).
   static Future<Map<String, bool>> checkBoth() async {
     try {
       final result =
@@ -31,6 +27,45 @@ class SessionPermissions {
       return result ?? const {};
     } on MissingPluginException {
       return const {};
+    }
+  }
+
+  /// Raises the Accessibility system alert if not yet trusted. Returns
+  /// whether the app is trusted right now.
+  static Future<bool> requestAccessibility() => _invokeBool('requestAccessibility');
+
+  /// Asks for Screen Recording (may add the app to Settings switched off
+  /// rather than show a prompt, on recent macOS). Returns whether access is
+  /// granted right now.
+  static Future<bool> requestScreenRecording() => _invokeBool('requestScreenCapture');
+
+  static Future<void> openScreenRecordingSettings() => _openSettings('screen');
+
+  static Future<void> openAccessibilitySettings() => _openSettings('accessibility');
+
+  /// Quits and reopens the app, so a newly granted Screen Recording
+  /// permission takes effect.
+  static Future<void> relaunch() async {
+    try {
+      await _channel.invokeMethod('relaunch');
+    } on MissingPluginException {
+      // nothing to do off macOS
+    }
+  }
+
+  static Future<bool> _invokeBool(String method) async {
+    try {
+      return await _channel.invokeMethod<bool>(method) ?? false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  static Future<void> _openSettings(String pane) async {
+    try {
+      await _channel.invokeMethod('openPrivacySettings', {'pane': pane});
+    } on MissingPluginException {
+      // nothing to do off macOS
     }
   }
 }

@@ -156,8 +156,6 @@ const Duration _mediasoupRecoveryResendCadence = Duration(seconds: 10);
 const Duration _sessionReconnectBackstop = Duration(seconds: 150);
 
 class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener {
-  final _jidController = TextEditingController();
-  final _passwordController = TextEditingController();
   final RTCVideoRenderer _renderer = RTCVideoRenderer();
   final MediasoupSignaling _signaling = MediasoupSignaling();
 
@@ -181,14 +179,13 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   // Guest-code flow (the default entry path): the app connects via a
   // persistent per-device identity (see _connectPersistent()) and asks the
   // orchestrator for a short pairing code, which the agent redeems instead
-  // of dialing a JID. The legacy JID/password sign-in survives behind the
-  // "Advanced" toggle below. _guestMode still means "auto-connected, no
-  // manual sign-in UI" - it no longer implies an anonymous XMPP identity,
+  // of dialing a JID. (The legacy JID/password sign-in behind an "Advanced"
+  // toggle was removed 2026-09-17.) _guestMode still means "auto-connected" -
+  // it no longer implies an anonymous XMPP identity,
   // see decision.md ("persistent per-device identity via a registered
   // user.oojack ejabberd account").
   bool _guestMode = false;
   String _guestCode = ''; // raw digits; rendered grouped XXX-XXX-XXX
-  bool _showLegacyLogin = false;
 
   // Permanent, HKDF-derived 12-digit connect code (see identity_store.dart
   // and rust/src/api/persistent_identity.rs) — non-null once a persistent
@@ -332,6 +329,18 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   DateTime? _xmppDownSince; // whixp itself reports the connection down
   bool _xmppReplacing = false;
 
+  // macOS permission setup (2026-09-17). Shown in place of the connect code
+  // while Screen Recording or Accessibility is missing, so the customer grants
+  // both before an agent ever connects — on a fresh Mac the old silent
+  // request at launch showed nothing, and the first prompts only appeared
+  // once a session had already started (and failed to share the screen).
+  bool _showPermissionSetup = false;
+  bool _screenRecordingGranted = false;
+  bool _accessibilityGranted = false;
+  bool _screenRecordingAsked = false;
+  bool _accessibilityAsked = false;
+  Timer? _permissionPollTimer;
+
   @override
   void initState() {
     super.initState();
@@ -349,32 +358,79 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     // just at _startCapture() time (see _requestPermissionsOnFirstLaunch()).
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
-      await _requestPermissionsOnFirstLaunch();
+      // Not awaited: connecting (and showing the code) must not wait on the
+      // customer answering system prompts.
+      unawaited(_startPermissionSetup());
       if (mounted && _phase == _Phase.disconnected) _connectPersistent();
     });
   }
 
-  static const _permissionsRequestedKey = 'permissions_requested_v1';
+  // v2: the v1 flag was set by the old silent request, which showed nothing
+  // on recent macOS — a Mac that has it must still get the explicit ask once.
+  static const _permissionsRequestedKey = 'permissions_requested_v2';
 
-  /// Fires the combined Accessibility + Screen Recording prompt once, on the
-  /// very first launch after install - before any session flow is reachable
-  /// - rather than only at _startCapture() time deep into an accepted
-  /// session. Persisted via shared_preferences so this never re-prompts on
-  /// later launches. The existing SessionPermissions.requestBoth() call in
-  /// _startCapture() is left in place unchanged: it's idempotent (a no-op
-  /// dialog-wise once granted/denied) and stays as a safety net for a user
-  /// who denied here and granted the permission later via System Settings.
-  Future<void> _requestPermissionsOnFirstLaunch() async {
+  /// macOS only. If either permission is missing at launch, show the setup
+  /// card (in place of the connect code) and keep its status live. On the
+  /// first launch it also asks straight away, one permission at a time, so
+  /// each system prompt can actually show. The session-start requestBoth()
+  /// in _startCapture() stays as a safety net.
+  Future<void> _startPermissionSetup() async {
+    if (!Platform.isMacOS) return; // Windows: no setup page, no polling, no prompts
+    await _refreshPermissionStatus();
+    if (_screenRecordingGranted && _accessibilityGranted) return;
+    _appendLog('[permissions] missing at launch — screen=$_screenRecordingGranted accessibility=$_accessibilityGranted');
+    if (mounted) setState(() => _showPermissionSetup = true);
+    _permissionPollTimer ??= Timer.periodic(const Duration(milliseconds: 1500), (_) => _refreshPermissionStatus());
     try {
       final prefs = await SharedPreferences.getInstance();
       if (prefs.getBool(_permissionsRequestedKey) == true) return;
-      await SessionPermissions.requestBoth();
       await prefs.setBool(_permissionsRequestedKey, true);
+      if (!_accessibilityGranted) await _askAccessibility();
+      // Give the first alert a moment before raising the second.
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (!_screenRecordingGranted) await _askScreenRecording();
     } catch (e) {
-      // Best-effort - a prefs/plugin failure here must never block the
-      // guest-connect flow that follows.
+      // Best-effort: the card and its buttons still work without this.
       _appendLog('[permissions] first-launch request failed: $e');
     }
+  }
+
+  Future<void> _refreshPermissionStatus() async {
+    final status = await SessionPermissions.checkBoth();
+    final screen = status['screenCapture'] ?? false;
+    final accessibility = status['accessibility'] ?? false;
+    if (!mounted) return;
+    if (screen != _screenRecordingGranted || accessibility != _accessibilityGranted) {
+      setState(() {
+        _screenRecordingGranted = screen;
+        _accessibilityGranted = accessibility;
+      });
+    }
+    if (_showPermissionSetup && screen && accessibility) {
+      _appendLog('[permissions] both allowed');
+      _closePermissionSetup();
+      _showTransientBanner('Permissions allowed');
+    }
+  }
+
+  void _closePermissionSetup() {
+    _permissionPollTimer?.cancel();
+    _permissionPollTimer = null;
+    if (mounted) setState(() => _showPermissionSetup = false);
+  }
+
+  Future<void> _askAccessibility() async {
+    if (mounted) setState(() => _accessibilityAsked = true);
+    final granted = await SessionPermissions.requestAccessibility();
+    _appendLog('[permissions] accessibility requested — allowed=$granted');
+    await _refreshPermissionStatus();
+  }
+
+  Future<void> _askScreenRecording() async {
+    if (mounted) setState(() => _screenRecordingAsked = true);
+    final granted = await SessionPermissions.requestScreenRecording();
+    _appendLog('[permissions] screen recording requested — allowed=$granted');
+    await _refreshPermissionStatus();
   }
 
   @override
@@ -393,6 +449,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     _chatController.dispose();
     _chatScrollController.dispose();
     _transientBannerTimer?.cancel();
+    _permissionPollTimer?.cancel();
     super.dispose();
   }
 
@@ -471,15 +528,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
       _phase = phase;
       _statusText = status;
     });
-  }
-
-  void _connect() {
-    final jid = _jidController.text.trim();
-    final password = _passwordController.text;
-    if (jid.isEmpty || password.isEmpty) return;
-
-    _guestMode = false;
-    _startXmpp(XmppClient(jid, password));
   }
 
   void _connectGuest() {
@@ -2454,7 +2502,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
 
   Widget _buildStartBody() {
     if (_phase == _Phase.identityRecovery) return _buildIdentityRecoveryBody();
-    return _showLegacyLogin ? _buildSignInBody() : _buildGuestStartBody();
+    return _buildGuestStartBody();
   }
 
   /// Spec §7's explicit recovery state: this device's identity couldn't be
@@ -2502,8 +2550,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   }
 
   /// Default entry screen: no credentials, just the guest session spinning
-  /// up (it auto-starts on launch). Errors land here with a retry button;
-  /// the legacy JID/password card stays reachable via the Advanced toggle.
+  /// up (it auto-starts on launch). Errors land here with a retry button.
   Widget _buildGuestStartBody() {
     final connecting = _phase == _Phase.connecting;
     return Center(
@@ -2545,71 +2592,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
                     const SizedBox(height: 12),
                     Text(_statusText, style: const TextStyle(color: AppColors.danger)),
                   ],
-                  const SizedBox(height: 16),
-                  TextButton(
-                    onPressed: connecting
-                        ? null
-                        : () => setState(() => _showLegacyLogin = true),
-                    child: const Text('Advanced: sign in with JID'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildSignInBody() {
-    return Center(
-      child: SingleChildScrollView(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 400),
-          child: Card(
-            margin: const EdgeInsets.all(24),
-            child: Padding(
-              padding: const EdgeInsets.all(28),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text('Sign in', style: Theme.of(context).textTheme.titleLarge),
-                  const SizedBox(height: 4),
-                  Text(
-                    'Connect to the orchestrator to start producing.',
-                    style: TextStyle(color: AppColors.textSecondary),
-                  ),
-                  const SizedBox(height: 24),
-                  TextField(
-                    controller: _jidController,
-                    enabled: _phase != _Phase.connecting,
-                    decoration: const InputDecoration(labelText: 'JID'),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _passwordController,
-                    enabled: _phase != _Phase.connecting,
-                    obscureText: true,
-                    decoration: const InputDecoration(labelText: 'Password'),
-                    onSubmitted: (_) => _connect(),
-                  ),
-                  const SizedBox(height: 20),
-                  FilledButton(
-                    onPressed: _phase == _Phase.connecting ? null : _connect,
-                    child: Text(_phase == _Phase.connecting ? 'Connecting…' : 'Connect'),
-                  ),
-                  if (_phase == _Phase.error) ...[
-                    const SizedBox(height: 12),
-                    Text(_statusText, style: const TextStyle(color: AppColors.danger)),
-                  ],
-                  const SizedBox(height: 16),
-                  TextButton(
-                    onPressed: _phase == _Phase.connecting
-                        ? null
-                        : () => setState(() => _showLegacyLogin = false),
-                    child: const Text('Back to guest session'),
-                  ),
                 ],
               ),
             ),
@@ -3105,6 +3087,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
       );
     }
 
+    // macOS only, checked here as well as in _startPermissionSetup(): the
+    // Windows client has no such permissions and must never see this page.
+    if (Platform.isMacOS &&
+        _showPermissionSetup &&
+        (_phase == _Phase.connected || _phase == _Phase.connecting || _phase == _Phase.disconnected)) {
+      return _buildPermissionSetup();
+    }
+
     if (_phase == _Phase.connected && _guestMode) {
       // A persistent identity's permanent code takes priority over the
       // ephemeral guest code — a device with one never requests the other
@@ -3195,6 +3185,127 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
         _previewPlaceholderText,
         style: TextStyle(color: AppColors.textSecondary),
         textAlign: TextAlign.center,
+      ),
+    );
+  }
+
+  /// macOS permission setup card — see _startPermissionSetup().
+  Widget _buildPermissionSetup() {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 480),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.shield_outlined, color: AppColors.live, size: 40),
+              const SizedBox(height: 14),
+              Text(
+                'Allow Oojack to help you',
+                style: Theme.of(context).textTheme.titleMedium,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Your support agent needs these two permissions to see your screen and help with your mouse and keyboard.',
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 18),
+              _buildPermissionRow(
+                icon: Icons.screen_share_outlined,
+                title: 'Screen recording',
+                detail: 'So your agent can see your screen.',
+                granted: _screenRecordingGranted,
+                asked: _screenRecordingAsked,
+                onAllow: _askScreenRecording,
+                onOpenSettings: SessionPermissions.openScreenRecordingSettings,
+              ),
+              const SizedBox(height: 10),
+              _buildPermissionRow(
+                icon: Icons.mouse_outlined,
+                title: 'Accessibility',
+                detail: 'So your agent can use your mouse and keyboard.',
+                granted: _accessibilityGranted,
+                asked: _accessibilityAsked,
+                onAllow: _askAccessibility,
+                onOpenSettings: SessionPermissions.openAccessibilitySettings,
+              ),
+              const SizedBox(height: 14),
+              if (!_screenRecordingGranted && _screenRecordingAsked) ...[
+                Text(
+                  'Switched Oojack on in Settings? macOS needs the app reopened before screen recording works.',
+                  style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 8),
+                FilledButton.tonal(
+                  onPressed: SessionPermissions.relaunch,
+                  child: const Text('Reopen Oojack'),
+                ),
+                const SizedBox(height: 8),
+              ],
+              TextButton(
+                onPressed: _closePermissionSetup,
+                style: TextButton.styleFrom(foregroundColor: AppColors.textSecondary),
+                child: const Text('Continue without'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPermissionRow({
+    required IconData icon,
+    required String title,
+    required String detail,
+    required bool granted,
+    required bool asked,
+    required Future<void> Function() onAllow,
+    required Future<void> Function() onOpenSettings,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(kCornerRadius),
+        border: Border.all(color: granted ? AppColors.live.withValues(alpha: 0.4) : AppColors.hairline),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: granted ? AppColors.live : AppColors.textSecondary, size: 22),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+                const SizedBox(height: 2),
+                Text(detail, style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          if (granted)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.check_circle_rounded, color: AppColors.live, size: 18),
+                const SizedBox(width: 6),
+                Text('Allowed', style: TextStyle(color: AppColors.live, fontSize: 13)),
+              ],
+            )
+          else
+            // First click raises the system prompt; after that, macOS only
+            // lets the user switch it on in Settings, so go straight there.
+            FilledButton(
+              onPressed: asked ? onOpenSettings : onAllow,
+              child: Text(asked ? 'Open Settings' : 'Allow'),
+            ),
+        ],
       ),
     );
   }
