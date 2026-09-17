@@ -399,8 +399,19 @@ class UnifiedPlan extends HandlerInterface {
     }
 
     if (_direction == Direction.send) {
+      // PATCHED (2026-09-17): upstream passed `{'iceRestart': true}`, the
+      // browser RTCOfferOptions shape. flutter_webrtc's native bindings
+      // (macos FlutterRTCPeerConnection.m parseMediaConstraints, common/cpp
+      // ParseMediaConstraints) read only 'mandatory'/'optional' and drop that
+      // key silently, so the offer kept the old local ICE credentials while
+      // the remote answer carried the server's new ones — the send transport
+      // never reconnected after a network drop (recv worked: the server's new
+      // offer forces the restart there). Mark the restart natively AND pass
+      // the libwebrtc constraint, so either path produces a restarting offer.
+      await _pc!.restartIce();
       RTCSessionDescription offer = await _pc!.createOffer({
-        'iceRestart': true,
+        'mandatory': {'IceRestart': true},
+        'optional': [],
       });
 
       // // 'restartIce() | calling pc.setLocalDescription() [offer:${offer.toMap()}]');

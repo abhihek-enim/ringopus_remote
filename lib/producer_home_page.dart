@@ -141,7 +141,12 @@ enum _TeardownReason { userRequested, remoteTerminated, xmppUnrecoverable, media
 // ICE restart (preserves the producer, so the agent's video resumes on its own)
 // against the orchestrator's restart-ice handler.
 const Duration _mediasoupIceGracePeriod = Duration(seconds: 5); // ICE 'disconnected' self-heal window before acting
-const Duration _mediasoupRecoveryResendCadence = Duration(seconds: 4); // re-send restart-ice this often while still down
+// Re-send restart-ice this often while still down. Every request rotates the
+// server's ICE credentials, and mediasoup accepts only the current and the
+// previous set — at 4s a restart still completing (TURN allocation, a slow
+// network coming back) could have its credentials rotated away twice before
+// it finished. A restart that works connects in a second or two.
+const Duration _mediasoupRecoveryResendCadence = Duration(seconds: 10);
 // The SERVER decides when a lost session is over (connectionHold.js,
 // CONNECTION_HOLD_MS = 120s) and says so with session-terminated. This app
 // keeps trying for longer than that, so it can never give up on a session
