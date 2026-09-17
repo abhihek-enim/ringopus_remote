@@ -139,14 +139,16 @@ enum _TeardownReason { userRequested, remoteTerminated, xmppUnrecoverable, media
 
 // Reconnection tunables for the mediasoup/ICE drop path. The recovery model is
 // ICE restart (preserves the producer, so the agent's video resumes on its own)
-// against the orchestrator's restart-ice handler. Not measured against real
-// network conditions yet - see the plan's Verification section.
+// against the orchestrator's restart-ice handler.
 const Duration _mediasoupIceGracePeriod = Duration(seconds: 5); // ICE 'disconnected' self-heal window before acting
 const Duration _mediasoupRecoveryResendCadence = Duration(seconds: 4); // re-send restart-ice this often while still down
-const Duration _mediasoupReconnectWindow = Duration(seconds: 30); // overall give-up deadline once ICE drops
-// Aligned to the mediasoup window so a pure-XMPP death gives up on the same ~30s
-// budget; the server holds the session ~45s (a longer backstop) either way.
-const Duration _xmppUnrecoverableWindow = Duration(seconds: 30);
+// The SERVER decides when a lost session is over (connectionHold.js,
+// CONNECTION_HOLD_MS = 120s) and says so with session-terminated. This app
+// keeps trying for longer than that, so it can never give up on a session
+// the server is still holding (cause 2 of the 2026-09-16 wifi-toggle failure,
+// when this was 30s against the server's 45s). The backstop only matters if
+// the server's verdict never reaches us. Shared by the XMPP and ICE paths.
+const Duration _sessionReconnectBackstop = Duration(seconds: 150);
 
 class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener {
   final _jidController = TextEditingController();
@@ -198,17 +200,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   // construct its own full JID.
   static const _deviceIdentityVhost = 'user.oojack';
 
-  // Consent gate for session-incoming: nothing is accepted until the
-  // customer clicks Allow. Auto-declines after a minute so an unanswered
-  // prompt doesn't strand the agent's request forever.
-  bool _consentPending = false;
-  Timer? _consentTimer;
-  static const Duration _consentTimeout = Duration(seconds: 60);
-
   // Mandatory per-session 6-digit code, minted by the orchestrator and
-  // carried on session-incoming — read this aloud to the agent as an extra
-  // authentication step. Non-null for the lifetime of a pending/in-progress
-  // consent flow; null once the session is fully active or torn down.
+  // carried on session-incoming. It is the customer's consent: the session
+  // is accepted automatically, and starts only once the customer has read
+  // this aloud and the agent has typed it in (the server's 120s auth-code
+  // timer bounds the wait). There is no Allow/Decline card any more.
+  // Non-null while a request is waiting on the code; null otherwise.
   String? _sessionAuthCode;
 
   // Orthogonal to _Phase, not a new phase value: _Phase.sharing correctly
@@ -216,6 +213,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   // never stop - only whether an agent is actively watching/controlling
   // changes.
   bool _agentOnHold = false;
+  // The agent's own connection dropped (server connection-hold, party
+  // 'agent'). Separate from _agentOnHold (the agent's deliberate hold) so
+  // lifting one never resumes sharing the other still wants paused.
+  bool _agentConnectionLost = false;
+  bool get _sharingPaused => _agentOnHold || _agentConnectionLost;
   String? _transientBanner;
   Timer? _transientBannerTimer;
 
@@ -373,16 +375,48 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     _chatController.dispose();
     _chatScrollController.dispose();
     _transientBannerTimer?.cancel();
-    _consentTimer?.cancel();
     super.dispose();
   }
 
-  void _setHold(bool held, String status) {
-    if (!mounted) return;
-    setState(() {
-      _agentOnHold = held;
-      _statusText = status;
-    });
+  /// The one place the agent-side pause reasons — its deliberate hold
+  /// (session-held) and its lost connection (connection-hold) — become
+  /// sending/injection state. Either keeps sharing paused; lifting one never
+  /// resumes while the other still holds. Omitted arguments keep their value.
+  Future<void> _setAgentPauseState({bool? manualHold, bool? connectionLost}) async {
+    final wasPaused = _sharingPaused;
+    final nextHold = manualHold ?? _agentOnHold;
+    final nextLost = connectionLost ?? _agentConnectionLost;
+    final status = nextLost
+        ? "Agent's connection dropped — waiting for them to reconnect"
+        : nextHold
+        ? 'On hold — agent stepped away'
+        : 'Sharing "$_sourceName"';
+    if (mounted) {
+      setState(() {
+        _agentOnHold = nextHold;
+        _agentConnectionLost = nextLost;
+        _statusText = status;
+      });
+    }
+    final nowPaused = nextHold || nextLost;
+    if (nowPaused && !wasPaused) {
+      _signaling.pauseSending();
+      // Defence-in-depth: disarm input injection while paused so an agent
+      // that is away (or reconnecting) can never inject into this customer,
+      // independent of the server pausing our input consumers at the SFU.
+      try {
+        await stopInputInjection();
+      } catch (e) {
+        _appendLog('stopInputInjection (pause) failed: $e');
+      }
+    } else if (!nowPaused && wasPaused) {
+      _signaling.resumeSending();
+      try {
+        await startInputInjection();
+      } catch (e) {
+        _appendLog('startInputInjection (resume) failed: $e');
+      }
+    }
   }
 
   void _showTransientBanner(String text) {
@@ -769,6 +803,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     xmpp.onConnected = (boundJid) {
       _appendLog('[xmpp] connected as $boundJid');
       _xmppConnected = true; // stream is negotiated/bound — restart-ice can now travel
+      if (_sessionInProgress) {
+        // A reconnect in the middle of a session (XEP-0198 resume or a fresh
+        // bind). Resetting the phase or reloading the device here would pull
+        // the app out of the session it is still in; instead catch up on
+        // whatever the server said while we were gone.
+        _onXmppStreamRestored();
+        return;
+      }
       _setPhase(_Phase.connected, 'Connected — requesting router capabilities…');
       xmpp.sendToComponent({'type': 'get-router-caps'});
     };
@@ -785,6 +827,31 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     xmpp.onStateChanged = _onXmppStateChanged;
     xmpp.connect();
     _setPhase(_Phase.connecting, 'Connecting…');
+  }
+
+  bool get _sessionInProgress =>
+      _signaling.sid.isNotEmpty &&
+      (_phase == _Phase.sessionIncoming || _phase == _Phase.ready || _phase == _Phase.sharing);
+
+  /// XMPP is usable again mid-session: messages sent to us while we were
+  /// offline are gone, so ask the server for the session's current state
+  /// (session-sync → session-state, or session-terminated if it ended), and
+  /// let any ICE restart that was waiting on XMPP go out now.
+  void _onXmppStreamRestored() {
+    _xmppUnrecoverableTimer?.cancel();
+    _xmppUnrecoverableTimer = null;
+    if (_xmppReconnecting && mounted) setState(() => _xmppReconnecting = false);
+    final sid = _signaling.sid;
+    if (sid.isEmpty) return;
+    _xmpp?.sendToComponent({'type': 'session-sync', 'sid': sid});
+    // XEP-0198 resume would have redelivered queued chat stanzas anyway, but
+    // a fresh bind does not.
+    if (_chatAvailable) {
+      _xmpp?.sendToComponent({'type': 'chat-history-request', 'sid': sid});
+    }
+    for (final label in _mediasoupNeedingRecovery.toList()) {
+      _pumpMediasoupRecovery(label);
+    }
   }
 
   Future<void> _disconnect() async {
@@ -842,6 +909,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
         _appendLog('--- session-incoming from ${msg['from']} (sid=$sid) ---');
         if (_signaling.device == null) {
           _appendLog('ERROR: session-incoming before device loaded');
+          // Tell the agent instead of leaving its request spinning until it
+          // cancels — nothing was accepted, so a plain reject is enough.
+          _xmpp?.sendToComponent({'type': 'session-reject', 'sid': sid, 'reason': 'not-ready'});
           return;
         }
         _signaling.sid = sid;
@@ -850,31 +920,22 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
         // session — not only deep inside _startCapture()'s success path
         // (still done there too, as a second, harmless layer). A session
         // that never reaches _Phase.sharing (e.g. the agent cancels while
-        // this one is still waiting on consent/the auth code) would
+        // this one is still waiting on the auth code) would
         // otherwise leave _tearingDown stuck true from the PREVIOUS
         // session's already-completed teardown, silently no-opping this
         // session's own _teardownSession call on its first line — the
-        // consent card / auth-code screen would then sit there forever,
-        // looking like the request is still in progress even after the
-        // agent has actually cancelled. Real bug, found live once the auth
-        // code made this waiting window human-paced (up to 2 minutes)
-        // instead of near-instant.
+        // auth-code screen would then sit there forever, looking like the
+        // request is still in progress even after the agent has actually
+        // cancelled. Real bug, found live once the auth code made this
+        // waiting window human-paced (up to 2 minutes) instead of
+        // near-instant.
         _tearingDown = false;
-        // Consent gate: the session proceeds only after the customer clicks
-        // Allow (which sends the session-accept the old code sent here
-        // unconditionally). Decline sends session-reject, which the server
-        // already handles.
-        _consentTimer?.cancel();
-        _consentTimer = Timer(_consentTimeout, () {
-          if (_consentPending) _declinePendingSession(auto: true);
-        });
-        if (mounted) {
-          setState(() {
-            _consentPending = true;
-            _sessionAuthCode = msg['authCode'] as String?;
-          });
-        }
-        _setPhase(_Phase.sessionIncoming, 'Incoming session request');
+        // No Allow/Decline: the 6-digit auth code is the consent. Accept at
+        // once; the server creates transports only after the agent enters
+        // the code the customer reads out (see _sessionAuthCode).
+        if (mounted) setState(() => _sessionAuthCode = msg['authCode'] as String?);
+        _sendSessionAccept();
+        _setPhase(_Phase.sessionIncoming, 'Waiting for the agent to enter the code');
 
       case 'transport-params':
         final send = msg['send'] as Map<String, dynamic>;
@@ -898,7 +959,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
           });
         }
         _setPhase(_Phase.ready, 'Starting screen share…');
-        // Consent was already given at Allow — no separate manual step to
+        // Consent was already given via the auth code — no separate step to
         // start sharing. _startCapture() picks the first screen source
         // itself (no interactive picker), so this is safe to fire immediately.
         unawaited(_startCapture());
@@ -964,26 +1025,40 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
         // call — a file-failed for this side's transfer (if any) will also
         // arrive from the server, but don't wait on it to unstick the UI.
         _resetFileTransfer();
-        _signaling.pauseSending();
-        // Defence-in-depth: disarm input injection while held so a backgrounded
-        // agent tab can never inject into this customer, independent of the
-        // server pausing our input dataConsumer at the SFU. Re-armed on resume.
-        try {
-          await stopInputInjection();
-        } catch (e) {
-          _appendLog('stopInputInjection (hold) failed: $e');
-        }
-        _setHold(true, 'On hold — agent stepped away');
+        await _setAgentPauseState(manualHold: true);
 
       case 'session-resumed':
         _appendLog('--- session resumed (sid=${msg['sid']}) ---');
-        _signaling.resumeSending();
-        try {
-          await startInputInjection();
-        } catch (e) {
-          _appendLog('startInputInjection (resume) failed: $e');
+        await _setAgentPauseState(manualHold: false);
+
+      // Connection hold (server connectionHold.js): one side's media path is
+      // gone and the server is holding the session for it. When that side is
+      // the agent, pause like a manual hold until it is back. When it is us,
+      // our own ICE-restart loop (_onMediasoupStateChanged) is already on it.
+      case 'connection-hold':
+        final party = msg['party'] as String?;
+        _appendLog('--- connection hold: $party lost (sid=${msg['sid']}, ends in ${msg['deadlineMs']}ms unless it returns) ---');
+        if (party == 'agent') {
+          _resetFileTransfer();
+          await _setAgentPauseState(connectionLost: true);
         }
-        _setHold(false, 'Sharing "$_sourceName"');
+
+      case 'connection-restored':
+        final party = msg['party'] as String?;
+        _appendLog('--- connection restored: $party (sid=${msg['sid']}) ---');
+        if (party == 'agent') await _setAgentPauseState(connectionLost: false);
+
+      // Reply to our session-sync after XMPP came back: anything we missed.
+      case 'session-state':
+        final hold = msg['connectionHold'] as Map<String, dynamic>?;
+        final lost = (hold?['parties'] as List?)?.cast<String>() ?? const <String>[];
+        _appendLog('[sync] session-state: manualHold=${msg['manualHold']} connectionHold=$lost');
+        if (_phase == _Phase.sharing) {
+          await _setAgentPauseState(
+            manualHold: msg['manualHold'] == true,
+            connectionLost: lost.contains('agent'),
+          );
+        }
 
       // Cross-clipboard, both directions. These message types are
       // signaling-channel (XMPP), not the clipboard DataChannel itself —
@@ -1133,11 +1208,23 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
 
       case 'session-error':
         _appendLog('SESSION ERROR: ${msg['reason']}');
-        _setPhase(_Phase.error, 'Session error: ${msg['reason']}');
+        if (_phase == _Phase.sessionIncoming) {
+          // Still waiting on the auth code (auth-code-timeout,
+          // too-many-code-attempts): the server has already dropped the
+          // request, so go back to the idle code screen rather than an error
+          // page the customer must click out of.
+          await _teardownSession(reason: _TeardownReason.remoteTerminated, notifyPeer: false);
+          _setPhase(_Phase.connected, _pendingRequestErrorText(msg['reason'] as String?));
+        } else {
+          _setPhase(_Phase.error, 'Session error: ${msg['reason']}');
+        }
 
       case 'session-terminated':
-        _appendLog('--- session terminated ---');
+        final reason = msg['reason'] as String?;
+        _appendLog('--- session terminated (reason=$reason) ---');
         await _teardownSession(reason: _TeardownReason.remoteTerminated, notifyPeer: false);
+        final why = _terminationStatusText(reason);
+        if (why != null) _setPhase(_Phase.connected, why);
 
       // Orchestrator's reply to a client-initiated 'restart-ice' request:
       // fresh iceParameters for the customer's send/recv transport. 'attemptId'
@@ -1151,10 +1238,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     }
   }
 
-  void _acceptPendingSession() {
-    if (!_consentPending || _xmpp == null) return;
-    _consentTimer?.cancel();
-    setState(() => _consentPending = false);
+  void _sendSessionAccept() {
+    if (_xmpp == null) return;
     _xmpp!.sendToComponent({
       'type': 'session-accept',
       'sid': _signaling.sid,
@@ -1171,29 +1256,34 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
       // agent side, no translation table needed between the two apps.
       'customerOs': Platform.operatingSystem,
     });
-    _setPhase(_Phase.sessionIncoming, 'Session accepted — setting up transports…');
   }
 
-  void _declinePendingSession({bool auto = false}) {
-    if (!_consentPending) return;
-    _consentTimer?.cancel();
-    _xmpp?.sendToComponent({
-      'type': 'session-reject',
-      'sid': _signaling.sid,
-      'reason': auto ? 'timeout' : 'declined',
-    });
-    _signaling.sid = '';
-    if (mounted) {
-      setState(() {
-        _consentPending = false;
-        _sessionAuthCode = null;
-      });
-    }
-    _setPhase(_Phase.connected, auto ? 'Request timed out' : 'Request declined');
-    // The code was consumed when the agent's request created the session -
-    // the customer needs a fresh one for the next attempt.
-    _refreshGuestCode();
+  /// The customer backing out while the auth code is still on screen. Ends
+  /// the request through the normal terminate path (not session-reject): the
+  /// session was already accepted, and the agent may be typing the code at
+  /// this very moment, so the server must be free to tear down whatever that
+  /// verification already created. Teardown also refreshes a guest code.
+  Future<void> _cancelPendingSession() async {
+    if (_phase != _Phase.sessionIncoming) return;
+    await _teardownSession(
+      reason: _TeardownReason.userRequested,
+      notifyPeer: true,
+      wireReason: 'customer-cancelled',
+    );
+    _setPhase(_Phase.connected, 'Request cancelled');
   }
+
+  String? _terminationStatusText(String? reason) => switch (reason) {
+    'agent-connection-lost' => "The agent's connection was lost — the session ended",
+    'customer-connection-lost' || 'connection-lost' || 'not-found' => 'Connection lost — the session ended',
+    _ => null,
+  };
+
+  String _pendingRequestErrorText(String? reason) => switch (reason) {
+    'auth-code-timeout' => 'The agent did not enter the code in time',
+    'too-many-code-attempts' => 'Too many wrong codes were entered',
+    _ => 'The request ended',
+  };
 
   /// Requests a replacement pairing code. The server invalidates any prior
   /// pending code for this JID, so this is always safe to call when idle.
@@ -1482,8 +1572,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   String _statusTextFor(_TeardownReason reason) => switch (reason) {
     _TeardownReason.userRequested => 'Stopped — waiting for a new session request…',
     _TeardownReason.remoteTerminated => 'Session ended — waiting for a new request…',
-    _TeardownReason.xmppUnrecoverable => 'Connection lost — session ended',
-    _TeardownReason.mediasoupUnrecoverable => 'Connection lost — session ended',
+    _TeardownReason.xmppUnrecoverable => 'Connection lost — the session ended',
+    _TeardownReason.mediasoupUnrecoverable => 'Connection lost — the session ended',
     _TeardownReason.appDisposed => 'App closing',
   };
 
@@ -1522,7 +1612,11 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   /// comment. Dart async functions run synchronously up to their first
   /// await, so anything placed after an earlier await in this function
   /// would NOT get that guarantee.
-  Future<void> _teardownSession({required _TeardownReason reason, bool notifyPeer = true}) async {
+  Future<void> _teardownSession({
+    required _TeardownReason reason,
+    bool notifyPeer = true,
+    String? wireReason, // overrides reason.name on the session-terminate sent to the server
+  }) async {
     if (_tearingDown) return;
     _tearingDown = true;
     unawaited(_undockAndRestore()); // no-op if never docked this session
@@ -1530,7 +1624,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     final sid = _signaling.sid;
     if (notifyPeer && sid.isNotEmpty && _xmpp != null) {
       try {
-        _xmpp!.sendToComponent({'type': 'session-terminate', 'sid': sid, 'reason': reason.name});
+        _xmpp!.sendToComponent({'type': 'session-terminate', 'sid': sid, 'reason': wireReason ?? reason.name});
       } catch (_) {}
     }
     // Every cleanup call below is independently try/caught: a failure in ANY
@@ -1559,6 +1653,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
       _appendLog('_signaling.cleanup failed: $e');
     }
     _agentOnHold = false;
+    _agentConnectionLost = false;
     _pendingClipboardConsumerReady = null;
     _clipboardConsumerReadyReceived = false;
     _stopClipboardWatcher();
@@ -1566,8 +1661,6 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     _resetFileTransfer();
     _xmppReconnecting = false;
     _mediasoupRecovering = false;
-    _consentTimer?.cancel();
-    _consentPending = false;
     _sessionAuthCode = null;
     _chatAvailable = false;
     _chatOpen = false;
@@ -1575,8 +1668,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     _unreadChatCount = 0;
     _cancelAllDropTimers();
     if (mounted) {
-      final backToIdle =
-          reason == _TeardownReason.userRequested || reason == _TeardownReason.remoteTerminated;
+      // A lost network is not an error the customer must click out of: go
+      // back to the connect-code screen so the agent can simply reconnect.
+      // Only app shutdown skips it.
+      final backToIdle = reason != _TeardownReason.appDisposed;
       _setPhase(backToIdle ? _Phase.connected : _Phase.error, _statusTextFor(reason));
       // Back on the idle screen: the old code is gone (consumed when this
       // session was created), so fetch a fresh one for the next agent.
@@ -1590,25 +1685,10 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     if (_tearingDown) return;
     switch (state) {
       case TransportState.connected:
-        _xmppConnected = true;
-        _xmppUnrecoverableTimer?.cancel();
-        _xmppUnrecoverableTimer = null;
-        if (_xmppReconnecting && mounted) {
-          setState(() => _xmppReconnecting = false);
-          // Request an authoritative chat resync. XEP-0198 SM resume would
-          // have redelivered any queued chat-message stanzas transparently
-          // anyway, but this covers the case where the drop actually forced
-          // a fresh bind instead of a resume.
-          if (_chatAvailable && _signaling.sid.isNotEmpty) {
-            _xmpp?.sendToComponent({'type': 'chat-history-request', 'sid': _signaling.sid});
-          }
-        }
-        // XMPP is the transport for restart-ice signaling. Any mediasoup
-        // recovery that was waiting for XMPP to come back can now fire
-        // immediately, rather than idling until its next cadence tick.
-        for (final label in _mediasoupNeedingRecovery.toList()) {
-          _pumpMediasoupRecovery(label);
-        }
+        // Only the socket is open here — SASL, resume and bind have not
+        // happened, so nothing can be sent yet. XMPP counts as back once the
+        // stream is negotiated: xmpp.onConnected → _onXmppStreamRestored.
+        break;
       case TransportState.connectionFailure:
       case TransportState.reconnecting:
       case TransportState.disconnected:
@@ -1618,9 +1698,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
         // already self-heal brief blips with zero app involvement; only
         // escalate if this drags on past the grace window below.
         _xmppConnected = false;
-        if (_xmppUnrecoverableTimer == null) {
+        if (_xmppUnrecoverableTimer == null && _sessionInProgress) {
           if (mounted) setState(() => _xmppReconnecting = true);
-          _xmppUnrecoverableTimer = Timer(_xmppUnrecoverableWindow, _declareXmppUnrecoverable);
+          _xmppUnrecoverableTimer = Timer(_sessionReconnectBackstop, _declareXmppUnrecoverable);
         }
       default:
       // pickingAddress/connecting/tlsSuccess/killed/terminated - no action.
@@ -1629,7 +1709,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
 
   void _declareXmppUnrecoverable() {
     if (_tearingDown) return;
-    _appendLog('[xmpp] no reconnect within the grace window — tearing down session');
+    _appendLog('[xmpp] no reconnect within the backstop window — tearing down session');
     unawaited(_teardownSession(reason: _TeardownReason.xmppUnrecoverable, notifyPeer: false));
   }
 
@@ -1684,7 +1764,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
     if (mounted) setState(() => _mediasoupRecovering = true);
     // One deadline governs the whole episode (both transports usually drop
     // together on a real network blip); don't restart it per-label.
-    _mediasoupReconnectDeadline ??= Timer(_mediasoupReconnectWindow, _onMediasoupReconnectDeadline);
+    _mediasoupReconnectDeadline ??= Timer(_sessionReconnectBackstop, _onMediasoupReconnectDeadline);
     _pumpMediasoupRecovery(label);
   }
 
@@ -1718,7 +1798,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
 
   void _onMediasoupReconnectDeadline() {
     if (_tearingDown) return;
-    _appendLog('[recovery] reconnect window elapsed — tearing down session');
+    _appendLog('[recovery] no reconnect within the backstop window — tearing down session');
     unawaited(_teardownSession(reason: _TeardownReason.mediasoupUnrecoverable, notifyPeer: true));
   }
 
@@ -1844,7 +1924,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   }
 
   Future<void> _pollClipboardForChange() async {
-    if (_phase != _Phase.sharing || _agentOnHold || _clipboardPushInFlight) return;
+    if (_phase != _Phase.sharing || _sharingPaused || _clipboardPushInFlight) return;
     ClipboardData? data;
     try {
       data = await Clipboard.getData(Clipboard.kTextPlain);
@@ -1959,7 +2039,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   // "Send File" — the only trigger for this direction, no keystroke
   // equivalent.
   Future<void> _sendFile() async {
-    if (_phase != _Phase.sharing || _agentOnHold || _activeFileTransfer != null) return;
+    if (_phase != _Phase.sharing || _sharingPaused || _activeFileTransfer != null) return;
 
     final result = await FilePicker.platform.pickFiles();
     final picked = result?.files.singleOrNull;
@@ -2149,7 +2229,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
       _phase != _Phase.identityRecovery;
 
   Color get _statusDotColor {
-    if (_phase == _Phase.sharing && (_agentOnHold || _xmppReconnecting || _mediasoupRecovering)) {
+    if (_phase == _Phase.sharing && (_sharingPaused || _xmppReconnecting || _mediasoupRecovering)) {
       return Colors.amber;
     }
     switch (_phase) {
@@ -2172,7 +2252,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   /// message (_statusText) already appears in the preview area, this is
   /// just the at-a-glance summary.
   String get _connectionStatusLabel {
-    if (_phase == _Phase.sharing && (_agentOnHold || _xmppReconnecting || _mediasoupRecovering)) {
+    if (_phase == _Phase.sharing && (_sharingPaused || _xmppReconnecting || _mediasoupRecovering)) {
       return 'Reconnecting…';
     }
     switch (_phase) {
@@ -2181,7 +2261,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
       case _Phase.connecting:
         return 'Connecting…';
       case _Phase.sessionIncoming:
-        return 'Incoming request';
+        return 'Waiting for code';
       case _Phase.connected:
       case _Phase.ready:
       case _Phase.sharing:
@@ -2840,8 +2920,8 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   }
 
   /// Compact, distinct-from-the-big-connect-code display for the mandatory
-  /// per-session auth code — shown inside the consent card (and the
-  /// post-Allow waiting state) rather than the idle-screen circular badge.
+  /// per-session auth code — shown on the waiting-for-code screen rather
+  /// than the idle-screen circular badge.
   Widget _buildAuthCodeBadge() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -2873,10 +2953,14 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   }
 
   /// What fills the preview box when there's no video: the share code while
-  /// idle in guest mode, the Allow/Decline consent card while a request is
-  /// pending, or the plain status text otherwise.
+  /// idle in guest mode, the per-session auth code while a request waits on
+  /// it, or the plain status text otherwise.
   Widget _buildPreviewPlaceholder() {
-    if (_phase == _Phase.sessionIncoming && _consentPending) {
+    // A request is in: the session was accepted automatically, and it starts
+    // once the agent types in the code shown here (up to two minutes, see
+    // server/sessionHandlers.js). Reading it out is the customer's consent,
+    // so say plainly what happens next, and offer a quiet way out.
+    if (_phase == _Phase.sessionIncoming) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -2884,7 +2968,7 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
             const Icon(Icons.screen_share_outlined, size: 40, color: AppColors.textSecondary),
             const SizedBox(height: 16),
             Text(
-              'You are about to share your screen to our agent.',
+              'Read this code to your agent to start sharing',
               style: Theme.of(context).textTheme.titleMedium,
               textAlign: TextAlign.center,
             ),
@@ -2898,55 +2982,12 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
               const SizedBox(height: 16),
               _buildAuthCodeBadge(),
             ],
-            const SizedBox(height: 20),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                OutlinedButton(
-                  onPressed: _declinePendingSession,
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: AppColors.danger,
-                    side: const BorderSide(color: AppColors.danger),
-                  ),
-                  child: const Text('Decline'),
-                ),
-                const SizedBox(width: 12),
-                FilledButton(
-                  onPressed: _acceptPendingSession,
-                  child: const Text('Allow'),
-                ),
-              ],
+            const SizedBox(height: 12),
+            TextButton(
+              onPressed: _cancelPendingSession,
+              style: TextButton.styleFrom(foregroundColor: AppColors.textSecondary),
+              child: const Text('Cancel'),
             ),
-          ],
-        ),
-      );
-    }
-
-    // Between clicking Allow and transports being ready, the auth-code
-    // exchange (mandatory, see server/sessionHandlers.js) can take up to two
-    // minutes — long enough that the code must stay visible here too, not
-    // just in the consent card above, or a customer who clicks Allow before
-    // reading it aloud loses it for the rest of this session.
-    if (_phase == _Phase.sessionIncoming && !_consentPending) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(
-              width: 22,
-              height: 22,
-              child: CircularProgressIndicator(strokeWidth: 2.5),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              'Waiting for the agent to enter the code…',
-              style: Theme.of(context).textTheme.titleMedium,
-              textAlign: TextAlign.center,
-            ),
-            if (_sessionAuthCode != null) ...[
-              const SizedBox(height: 16),
-              _buildAuthCodeBadge(),
-            ],
           ],
         ),
       );
@@ -3047,9 +3088,9 @@ class _ProducerHomePageState extends State<ProducerHomePage> with WindowListener
   }
 
   Widget _buildPreviewArea() {
-    final onHold = _phase == _Phase.sharing && _agentOnHold;
+    final onHold = _phase == _Phase.sharing && _sharingPaused;
     final cornerLabel = onHold
-        ? 'ON HOLD'
+        ? (_agentConnectionLost ? 'AGENT RECONNECTING' : 'ON HOLD')
         : _phase == _Phase.sharing
         ? _sourceName
         : 'Preview';
